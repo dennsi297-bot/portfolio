@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Mein Bot</title>
+</head>
+<body style="font-family: Arial; text-align: center; margin-top: 50px;">
+
+    <h1>🤖 Mein Bot</h1>
+
+    <input id="input" placeholder="Schreib was..." style="padding:10px; width:200px;">
+    <br><br>
+
+    <button onclick="send()" style="padding:10px;">Senden</button>
+
+    <p id="output"></p>
+
+    <script>
+        async function send() {
+            let text = document.getElementById("input").value;
+
+            let res = await fetch("/message", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({ text: text })
+            });
+
+            let data = await res.json();
+
+            document.getElementById("output").innerText = data.response;
+        }
+    </script>
+
+</body>
+</html>
