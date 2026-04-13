@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+von FastapiImportSchnelle API
 from pydantic import BaseModel
 
 app = FastAPI()
@@ -8,7 +8,7 @@ class Message(BaseModel):
 
 @app.get("/")
 def read_root():
-    return {"message": "Bot läuft auf GitHub 🚀"}
+    return {"message": "Bot läuft 🚀"}
 
 @app.post("/message")
 def handle_message(msg: Message):
