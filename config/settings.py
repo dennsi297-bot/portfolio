@@ -1,0 +1,30 @@
+import os
+
+
+# Central settings module so constants do not spread across the codebase.
+ETHERSCAN_BASE_URL = "https://api.etherscan.io/v2/api"
+TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+DECIMALS_METHOD = "0x313ce567"
+SYMBOL_METHOD = "0x95d89b41"
+NAME_METHOD = "0x06fdde03"
+
+SCAN_LOOKBACK_BLOCKS = 900
+SCAN_WINDOW_SECONDS = 3 * 60 * 60
+MARKET_LOG_PAGES = 2
+MARKET_LOG_PAGE_SIZE = 1000
+MIN_CLUSTER_WALLETS = 3
+MIN_TOKEN_EVENTS = 4
+MAX_METADATA_TOKENS = 25
+LARGE_EVENT_PERCENTILE = 0.8
+MAX_RESULTS = 5
+
+STABLECOIN_SYMBOLS = {"USDT", "USDC", "DAI", "USDE", "USDS", "FDUSD", "PYUSD", "TUSD", "RLUSD"}
+UNSUPPORTED_SCAN_TERMS = {
+    "sui": "SUI braucht eine eigene Sui-Datenquelle. Der aktuelle breite Scan deckt nur Ethereum ERC-20 Aktivitaet ab.",
+    "plume": "PLUME braucht eine eigene Plume- oder EVM-Datenquelle. Der aktuelle breite Scan deckt nur Ethereum ERC-20 Aktivitaet ab.",
+    "market": None,
+}
+
+
+def get_etherscan_api_key() -> str | None:
+    return os.getenv("ETHERSCAN_API_KEY")
