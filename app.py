@@ -25,46 +25,28 @@ class Message(BaseModel):
 WALLET_PATTERN = re.compile(r"^0x[a-fA-F0-9]{40}$")
 ETHERSCAN_BASE_URL = "https://api.etherscan.io/v2/api"
 TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+DECIMALS_METHOD = "0x313ce567"
+SYMBOL_METHOD = "0x95d89b41"
+NAME_METHOD = "0x06fdde03"
+
 SCAN_LOOKBACK_BLOCKS = 900
 SCAN_WINDOW_SECONDS = 3 * 60 * 60
+MARKET_LOG_PAGES = 2
+MARKET_LOG_PAGE_SIZE = 1000
 MIN_CLUSTER_WALLETS = 3
+MIN_TOKEN_EVENTS = 4
+MAX_METADATA_TOKENS = 25
+LARGE_EVENT_PERCENTILE = 0.8
 MAX_RESULTS = 5
+STABLECOIN_SYMBOLS = {"USDT", "USDC", "DAI", "USDE", "USDS", "FDUSD", "PYUSD", "TUSD"}
 
-TRACKED_TOKENS = {
-    "ondo": {
-        "symbol": "ONDO",
-        "contract": "0xfaba6f8e4a5e8ab82f62fe7c39859fa577269be3",
-        "decimals": 18,
-        "large_threshold": 100000.0,
-        "aliases": ["ondo"],
-    },
-    "eth": {
-        "symbol": "ETH",
-        "contract": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
-        "decimals": 18,
-        "large_threshold": 150.0,
-        "aliases": ["eth", "weth"],
-    },
-    "btc": {
-        "symbol": "BTC",
-        "contract": "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599",
-        "decimals": 8,
-        "large_threshold": 10.0,
-        "aliases": ["btc", "wbtc"],
-    },
-    "polygon": {
-        "symbol": "POL",
-        "contract": "0x455e53cbb86018ac2b8092fdcd39d8444affc3f6",
-        "decimals": 18,
-        "large_threshold": 500000.0,
-        "aliases": ["polygon", "matic", "pol"],
-    },
+UNSUPPORTED_SCAN_TERMS = {
+    "sui": "SUI braucht eine eigene Sui-Datenquelle. Der aktuelle breite Scan deckt nur Ethereum ERC-20 Aktivitaet ab.",
+    "plume": "PLUME braucht eine eigene Plume- oder EVM-Datenquelle. Der aktuelle breite Scan deckt nur Ethereum ERC-20 Aktivitaet ab.",
+    "market": None,
 }
 
-UNSUPPORTED_TOKENS = {
-    "sui": "SUI braucht eine eigene Sui-Datenquelle und ist in diesem Ethereum-Scanner noch Platzhalter.",
-    "plume": "PLUME braucht eine eigene Chain- oder Explorer-Anbindung und ist hier noch Platzhalter.",
-}
+TOKEN_METADATA_CACHE: dict[str, dict] = {}
 
 
 def is_ethereum_wallet(text: str) -> bool:
@@ -202,46 +184,248 @@ def fetch_latest_block_number() -> int | None:
     return int(result, 16)
 
 
-def fetch_token_transfer_logs(contract_address: str, from_block: int, to_block: int) -> list[dict]:
+def fetch_market_transfer_logs(from_block: int, to_block: int) -> list[dict]:
     api_key = get_etherscan_api_key()
     if not api_key:
         return []
 
+    all_logs: list[dict] = []
+    seen_keys: set[tuple[str, str]] = set()
+
+    for page in range(1, MARKET_LOG_PAGES + 1):
+        data = call_etherscan(
+            {
+                "chainid": "1",
+                "module": "logs",
+                "action": "getLogs",
+                "fromBlock": str(from_block),
+                "toBlock": str(to_block),
+                "topic0": TRANSFER_TOPIC,
+                "page": str(page),
+                "offset": str(MARKET_LOG_PAGE_SIZE),
+                "apikey": api_key,
+            }
+        )
+
+        result = data.get("result")
+        if not isinstance(result, list) or not result:
+            break
+
+        for log in result:
+            log_key = (str(log.get("transactionHash", "")), str(log.get("logIndex", "")))
+            if log_key not in seen_keys:
+                seen_keys.add(log_key)
+                all_logs.append(log)
+
+        if len(result) < MARKET_LOG_PAGE_SIZE:
+            break
+
+    return all_logs
+
+
+def parse_address_from_topic(topic: str) -> str:
+    return f"0x{topic[-40:]}".lower()
+
+
+def parse_focus_term(text: str) -> tuple[str | None, str | None]:
+    parts = text.split(maxsplit=1)
+    if len(parts) == 1:
+        return None, None
+
+    focus_term = parts[1].strip().lower()
+    if not focus_term:
+        return None, None
+
+    limitation = UNSUPPORTED_SCAN_TERMS.get(focus_term)
+    if limitation:
+        return None, limitation
+    if focus_term == "market":
+        return None, None
+    return focus_term, None
+
+
+def decode_uint256(hex_value: str) -> int | None:
+    if not isinstance(hex_value, str) or not hex_value.startswith("0x"):
+        return None
+    try:
+        return int(hex_value, 16)
+    except ValueError:
+        return None
+
+
+def decode_abi_string(hex_value: str) -> str | None:
+    if not isinstance(hex_value, str) or not hex_value.startswith("0x"):
+        return None
+
+    body = hex_value[2:]
+    if not body:
+        return None
+
+    if len(body) == 64:
+        text = bytes.fromhex(body).rstrip(b"\x00").decode("utf-8", errors="ignore").strip()
+        return text or None
+
+    if len(body) < 128:
+        return None
+
+    try:
+        length = int(body[64:128], 16)
+    except ValueError:
+        return None
+
+    start = 128
+    end = start + (length * 2)
+    if end > len(body):
+        return None
+
+    text = bytes.fromhex(body[start:end]).decode("utf-8", errors="ignore").strip("\x00").strip()
+    return text or None
+
+
+def call_contract_method(contract_address: str, method_signature: str) -> str | None:
+    api_key = get_etherscan_api_key()
+    if not api_key:
+        return None
+
     data = call_etherscan(
         {
             "chainid": "1",
-            "module": "logs",
-            "action": "getLogs",
-            "fromBlock": str(from_block),
-            "toBlock": str(to_block),
-            "address": contract_address,
-            "topic0": TRANSFER_TOPIC,
+            "module": "proxy",
+            "action": "eth_call",
+            "to": contract_address,
+            "data": method_signature,
+            "tag": "latest",
+            "apikey": api_key,
+        }
+    )
+    return data.get("result")
+
+
+def fetch_token_metadata_from_history(contract_address: str) -> dict | None:
+    api_key = get_etherscan_api_key()
+    if not api_key:
+        return None
+
+    data = call_etherscan(
+        {
+            "chainid": "1",
+            "module": "account",
+            "action": "tokentx",
+            "contractaddress": contract_address,
             "page": "1",
-            "offset": "200",
+            "offset": "1",
+            "sort": "desc",
             "apikey": api_key,
         }
     )
 
     result = data.get("result")
-    if not isinstance(result, list):
-        return []
-    return result
+    if not isinstance(result, list) or not result:
+        return None
+
+    first_item = result[0]
+    decimals_text = str(first_item.get("tokenDecimal", ""))
+    if not decimals_text.isdigit():
+        return None
+
+    return {
+        "contract": contract_address,
+        "decimals": int(decimals_text),
+        "symbol": str(first_item.get("tokenSymbol", "")) or contract_address[:8],
+        "name": str(first_item.get("tokenName", "")) or str(first_item.get("tokenSymbol", "")) or contract_address[:8],
+    }
 
 
-def format_short_address(wallet_address: str) -> str:
-    return f"{wallet_address[:8]}...{wallet_address[-6:]}"
+def resolve_token_metadata(contract_address: str) -> dict | None:
+    contract_address = contract_address.lower()
+    if contract_address in TOKEN_METADATA_CACHE:
+        return TOKEN_METADATA_CACHE[contract_address]
+
+    metadata = fetch_token_metadata_from_history(contract_address)
+    if metadata is not None:
+        TOKEN_METADATA_CACHE[contract_address] = metadata
+        return metadata
+
+    decimals_hex = call_contract_method(contract_address, DECIMALS_METHOD)
+    symbol_hex = call_contract_method(contract_address, SYMBOL_METHOD)
+    name_hex = call_contract_method(contract_address, NAME_METHOD)
+
+    decimals = decode_uint256(decimals_hex or "")
+    symbol = decode_abi_string(symbol_hex or "")
+    name = decode_abi_string(name_hex or "")
+
+    if decimals is None:
+        return None
+
+    metadata = {
+        "contract": contract_address,
+        "decimals": decimals,
+        "symbol": symbol or contract_address[:8],
+        "name": name or (symbol or contract_address[:8]),
+    }
+    TOKEN_METADATA_CACHE[contract_address] = metadata
+    return metadata
 
 
-def build_reason(role: str, eth_amount: float, appearances: int) -> str:
-    size_label = "sehr gross" if eth_amount >= 1000 else "gross"
-    action = "Abfluss" if role == "sender" else "Zufluss"
-    if appearances > 1:
-        return f"{size_label}er {action}, mehrfach in grossen Transfers gesehen"
-    return f"{size_label}er {action} in den letzten Blocks"
+def filter_erc20_logs(logs: list[dict]) -> list[dict]:
+    filtered_logs = []
+    for log in logs:
+        topics = log.get("topics")
+        data_hex = log.get("data")
+        if not isinstance(topics, list) or len(topics) != 3:
+            continue
+        if not isinstance(data_hex, str) or data_hex == "0x":
+            continue
+        filtered_logs.append(log)
+    return filtered_logs
 
 
-def parse_address_from_topic(topic: str) -> str:
-    return f"0x{topic[-40:]}".lower()
+def select_candidate_contracts(logs: list[dict]) -> list[str]:
+    counts: dict[str, int] = {}
+    for log in logs:
+        contract = str(log.get("address", "")).lower()
+        if contract:
+            counts[contract] = counts.get(contract, 0) + 1
+
+    ranked_contracts = sorted(counts.items(), key=lambda item: item[1], reverse=True)
+    return [contract for contract, count in ranked_contracts if count >= MIN_TOKEN_EVENTS][:MAX_METADATA_TOKENS]
+
+
+def parse_token_event(log: dict, metadata: dict) -> dict | None:
+    topics = log.get("topics")
+    data_hex = log.get("data")
+    timestamp_hex = str(log.get("timeStamp", "0"))
+    if not isinstance(topics, list) or len(topics) != 3 or not isinstance(data_hex, str):
+        return None
+
+    raw_amount = decode_uint256(data_hex)
+    if raw_amount is None:
+        return None
+
+    try:
+        timestamp = int(timestamp_hex, 16)
+    except ValueError:
+        return None
+
+    amount = raw_amount / (10 ** metadata["decimals"])
+    return {
+        "contract": metadata["contract"],
+        "symbol": metadata["symbol"],
+        "name": metadata["name"],
+        "from": parse_address_from_topic(str(topics[1])),
+        "to": parse_address_from_topic(str(topics[2])),
+        "amount": amount,
+        "timestamp": timestamp,
+    }
+
+
+def calculate_large_event_threshold(amounts: list[float]) -> float | None:
+    positive_amounts = sorted(amount for amount in amounts if amount > 0)
+    if not positive_amounts:
+        return None
+
+    threshold_index = int((len(positive_amounts) - 1) * LARGE_EVENT_PERCENTILE)
+    return positive_amounts[threshold_index]
 
 
 def format_window(timestamp: int) -> str:
@@ -264,36 +448,29 @@ def build_signal_reason(signal: dict) -> str:
     strength = classify_signal_strength(signal["wallet_count"])
     direction_text = "akkumulieren" if signal["direction"] == "accumulation" else "verteilen"
     return (
-        f"{signal['wallet_count']} grosse Wallets {direction_text} "
-        f"{signal['symbol']} im selben Zeitfenster, daher {strength} Cluster."
+        f"{signal['wallet_count']} grosse Wallets {direction_text} {signal['symbol']} "
+        f"im selben Zeitfenster. Das wirkt wie ein {strength} Cluster."
     )
 
 
-def parse_token_transfer_event(log: dict, token: dict) -> dict | None:
-    topics = log.get("topics")
-    data_hex = log.get("data")
-    if not isinstance(topics, list) or len(topics) < 3 or not isinstance(data_hex, str):
-        return None
-
-    raw_amount = int(data_hex, 16)
-    amount = raw_amount / 10 ** token["decimals"]
-    timestamp = int(str(log.get("timeStamp", "0")), 16)
-
-    return {
-        "from": parse_address_from_topic(str(topics[1])),
-        "to": parse_address_from_topic(str(topics[2])),
-        "amount": amount,
-        "timestamp": timestamp,
-        "symbol": token["symbol"],
-    }
-
-
-def build_cluster_signals(token: dict, logs: list[dict]) -> list[dict]:
-    grouped_signals: dict[tuple[str, str, int], dict] = {}
-
+def build_contract_signals(metadata: dict, logs: list[dict]) -> list[dict]:
+    parsed_events = []
     for log in logs:
-        event = parse_token_transfer_event(log, token)
-        if event is None or event["amount"] < token["large_threshold"]:
+        event = parse_token_event(log, metadata)
+        if event is not None:
+            parsed_events.append(event)
+
+    if len(parsed_events) < MIN_TOKEN_EVENTS:
+        return []
+
+    threshold = calculate_large_event_threshold([event["amount"] for event in parsed_events])
+    if threshold is None or threshold <= 0:
+        return []
+
+    grouped_signals: dict[tuple[str, int], dict] = {}
+
+    for event in parsed_events:
+        if event["amount"] < threshold:
             continue
 
         bucket_start = event["timestamp"] - (event["timestamp"] % SCAN_WINDOW_SECONDS)
@@ -303,16 +480,19 @@ def build_cluster_signals(token: dict, logs: list[dict]) -> list[dict]:
         ]
 
         for direction, wallet in directional_events:
-            signal_key = (token["symbol"], direction, bucket_start)
+            signal_key = (direction, bucket_start)
             if signal_key not in grouped_signals:
                 grouped_signals[signal_key] = {
-                    "symbol": token["symbol"],
+                    "symbol": metadata["symbol"],
+                    "name": metadata["name"],
+                    "contract": metadata["contract"],
                     "direction": direction,
                     "wallets": set(),
                     "wallet_count": 0,
                     "time_window": format_window(event["timestamp"]),
                     "total_size": 0.0,
                     "event_count": 0,
+                    "large_threshold": threshold,
                 }
 
             grouped_signals[signal_key]["wallets"].add(wallet)
@@ -324,37 +504,69 @@ def build_cluster_signals(token: dict, logs: list[dict]) -> list[dict]:
     for signal in grouped_signals.values():
         if signal["wallet_count"] < MIN_CLUSTER_WALLETS:
             continue
-
-        signal["explanation"] = build_signal_reason(signal)
         signal["wallets"] = list(signal["wallets"])
+        signal["explanation"] = build_signal_reason(signal)
         signals.append(signal)
 
     return signals
 
 
-def resolve_scan_targets(text: str) -> tuple[list[dict], str | None]:
-    parts = text.split()
-    if len(parts) == 1:
-        return list(TRACKED_TOKENS.values()), None
+def matches_focus(signal: dict, focus_term: str | None) -> bool:
+    if not focus_term:
+        return False
 
-    requested_token = parts[1].lower()
-    if requested_token in UNSUPPORTED_TOKENS:
-        return [], UNSUPPORTED_TOKENS[requested_token]
-
-    for token in TRACKED_TOKENS.values():
-        if requested_token in token["aliases"]:
-            return [token], None
-
-    supported_names = ", ".join(token["symbol"] for token in TRACKED_TOKENS.values())
-    return [], f"Fehler: Token nicht bekannt. Unterstuetzt werden aktuell {supported_names}."
+    haystacks = [
+        signal["symbol"].lower(),
+        signal["name"].lower(),
+        signal["contract"].lower(),
+    ]
+    return any(focus_term in haystack for haystack in haystacks)
 
 
-def rank_signals(signals: list[dict], prioritized_symbol: str | None) -> list[dict]:
+def rank_signals(signals: list[dict], focus_term: str | None) -> list[dict]:
     def sort_key(signal: dict) -> tuple:
-        priority_bonus = 1 if prioritized_symbol and signal["symbol"] == prioritized_symbol else 0
-        return (priority_bonus, signal["wallet_count"], signal["total_size"], signal["event_count"])
+        focus_bonus = 1 if matches_focus(signal, focus_term) else 0
+        non_stable_bonus = 0 if signal["symbol"].upper() in STABLECOIN_SYMBOLS else 1
+        return (
+            focus_bonus,
+            non_stable_bonus,
+            signal["wallet_count"],
+            signal["event_count"],
+            signal["total_size"],
+        )
 
     return sorted(signals, key=sort_key, reverse=True)
+
+
+def format_scan_response(signals: list[dict], focus_term: str | None, sampled_logs: int) -> str:
+    lines = [
+        "Scan fertig. Starke Whale-Signale aus der aktuellen Ethereum-Transfer-Stichprobe:",
+    ]
+
+    for index, signal in enumerate(signals[:MAX_RESULTS], start=1):
+        lines.append(
+            f"{index}. {signal['symbol']} | {signal['direction']} | "
+            f"{signal['wallet_count']} grosse Wallets | {signal['time_window']} | "
+            f"{signal['total_size']:.2f} {signal['symbol']} | {signal['explanation']}"
+        )
+
+    if focus_term:
+        if any(matches_focus(signal, focus_term) for signal in signals):
+            lines.append(f"Priorisiert auf: {focus_term.upper()}")
+        else:
+            lines.append(f"Kein direktes Signal fuer {focus_term.upper()} im aktuellen Sample gefunden.")
+    else:
+        lines.append("Signal-first Modus: Tokens werden erst aus den Events entdeckt, nicht vorgegeben.")
+
+    lines.append(
+        f"Real: ERC-20 Transfer-Logs aus {sampled_logs} Events auf Ethereum. "
+        "Limit: Etherscan liefert hier nur eine Stichprobe, nicht den kompletten Markt."
+    )
+    lines.append(
+        "Proxy-Logik: accumulation/distribution wird aus grossen Token-Transfers abgeleitet, "
+        "nicht aus bestaetigten DEX-Buys oder DEX-Sells."
+    )
+    return "\n".join(lines)
 
 
 def scan_whale_token_activity(text: str) -> str:
@@ -362,13 +574,9 @@ def scan_whale_token_activity(text: str) -> str:
     if not api_key:
         return "Fehler: ETHERSCAN_API_KEY fehlt auf dem Server."
 
-    tokens_to_scan, target_error = resolve_scan_targets(text)
-    if target_error:
-        return target_error
-
-    prioritized_symbol = None
-    if len(tokens_to_scan) == 1:
-        prioritized_symbol = tokens_to_scan[0]["symbol"]
+    focus_term, limitation = parse_focus_term(text)
+    if limitation:
+        return limitation
 
     try:
         latest_block = fetch_latest_block_number()
@@ -376,47 +584,41 @@ def scan_whale_token_activity(text: str) -> str:
             return "Fehler: Letzter Ethereum-Block konnte nicht gelesen werden."
 
         from_block = max(latest_block - SCAN_LOOKBACK_BLOCKS, 0)
-        all_signals = []
+        market_logs = fetch_market_transfer_logs(from_block, latest_block)
+        erc20_logs = filter_erc20_logs(market_logs)
+        if not erc20_logs:
+            return "Fehler: Keine brauchbaren ERC-20 Transfer-Logs fuer den breiten Scan gefunden."
 
-        for token in tokens_to_scan:
-            logs = fetch_token_transfer_logs(token["contract"], from_block, latest_block)
-            token_signals = build_cluster_signals(token, logs)
-            all_signals.extend(token_signals)
+        candidate_contracts = select_candidate_contracts(erc20_logs)
+        if not candidate_contracts:
+            return "Keine auffaelligen Token-Cluster im aktuellen Markt-Sample gefunden."
 
-        if not all_signals:
+        logs_by_contract: dict[str, list[dict]] = {}
+        for log in erc20_logs:
+            contract = str(log.get("address", "")).lower()
+            if contract in candidate_contracts:
+                logs_by_contract.setdefault(contract, []).append(log)
+
+        signals = []
+        for contract in candidate_contracts:
+            metadata = resolve_token_metadata(contract)
+            if metadata is None:
+                continue
+            contract_signals = build_contract_signals(metadata, logs_by_contract.get(contract, []))
+            signals.extend(contract_signals)
+
+        if not signals:
             return (
                 "Kein starkes Whale-Cluster gefunden. "
-                "Das ist echte Onchain-Logik auf Transfer-Basis, aber noch kein DEX-Buy/Sell-Beweis."
+                "Der Scan ist echt breit ueber ERC-20 Transfers, aber das aktuelle Sample zeigt nichts Starkes."
             )
 
-        ranked_signals = rank_signals(all_signals, prioritized_symbol)[:MAX_RESULTS]
-        lines = [
-            "Scan fertig. Starke Whale-Signale aus dem letzten kurzen Zeitfenster:"
-        ]
-        for index, signal in enumerate(ranked_signals, start=1):
-            direction_text = (
-                "accumulation" if signal["direction"] == "accumulation" else "distribution"
-            )
-            lines.append(
-                f"{index}. {signal['symbol']} | {direction_text} | "
-                f"{signal['wallet_count']} Wallets | {signal['time_window']} | "
-                f"{signal['total_size']:.2f} {signal['symbol']} | {signal['explanation']}"
-            )
-
-        if prioritized_symbol:
-            lines.append(f"Priorisiert: {prioritized_symbol}")
-        else:
-            lines.append("Standard-Tracking: ONDO, ETH, BTC, POL")
-
-        lines.append(
-            "Hinweis: accumulation/distribution basiert hier auf grossen Token-Transfers, "
-            "nicht auf bestaetigten DEX-Buys oder -Sells."
-        )
-        return "\n".join(lines)
+        ranked_signals = rank_signals(signals, focus_term)
+        return format_scan_response(ranked_signals, focus_term, len(erc20_logs))
     except requests.RequestException:
-        return "Fehler: Token-Scan ueber Etherscan ist fehlgeschlagen."
+        return "Fehler: Der breite Token-Scan ueber Etherscan ist fehlgeschlagen."
     except ValueError:
-        return "Fehler: Etherscan hat ungueltige Token-Daten geliefert."
+        return "Fehler: Etherscan hat ungueltige Daten fuer den breiten Token-Scan geliefert."
 
 
 @app.get("/")
@@ -439,9 +641,8 @@ def handle_message(msg: Message):
     if "hilfe" in text:
         return {
             "response": (
-                "Schick mir eine Ethereum Wallet-Adresse und ich zeige dir "
-                "ETH Guthaben plus letzte Transaktionen. Mit scan suche ich "
-                "nach Whale-Clustern fuer ONDO, ETH, BTC oder POL."
+                "Schick mir eine Ethereum Wallet-Adresse fuer den Direktcheck. "
+                "Mit scan suche ich breit nach Whale-Clustern in Ethereum ERC-20 Transfers."
             )
         }
     if "preis" in text:
