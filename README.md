@@ -7,6 +7,8 @@ Aktuell kann der Bot:
 - Ethereum-Wallet-Adressen erkennen
 - ETH-Guthaben ueber Etherscan abfragen
 - die letzten Transaktionen kompakt anzeigen
+- mit `scan` die letzten Ethereum-Blocks nach grossen ETH-Transfers durchsuchen
+- interessante Sender und Empfaenger als Rangliste zurueckgeben
 
 Wichtige Environment Variable:
 - `ETHERSCAN_API_KEY`

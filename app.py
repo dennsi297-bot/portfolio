@@ -23,6 +23,9 @@ class Message(BaseModel):
 
 WALLET_PATTERN = re.compile(r"^0x[a-fA-F0-9]{40}$")
 ETHERSCAN_BASE_URL = "https://api.etherscan.io/v2/api"
+SCAN_BLOCK_COUNT = 5
+SCAN_THRESHOLDS = [100.0, 25.0, 10.0]
+MAX_RESULTS = 5
 
 
 def is_ethereum_wallet(text: str) -> bool:
@@ -72,7 +75,7 @@ def fetch_eth_balance(wallet_address: str) -> str:
 
 
 def fetch_recent_transactions(wallet_address: str) -> list[dict] | None:
-    api_key = os.getenv("ETHERSCAN_API_KEY")
+    api_key = get_etherscan_api_key()
     if not api_key:
         return None
 
@@ -140,6 +143,151 @@ def format_wallet_summary(wallet_address: str) -> str:
     return "\n".join(lines)
 
 
+def fetch_latest_block_number() -> int | None:
+    api_key = get_etherscan_api_key()
+    if not api_key:
+        return None
+
+    data = call_etherscan(
+        {
+            "chainid": "1",
+            "module": "proxy",
+            "action": "eth_blockNumber",
+            "apikey": api_key,
+        }
+    )
+
+    result = data.get("result")
+    if not isinstance(result, str):
+        return None
+    return int(result, 16)
+
+
+def fetch_block_transactions(block_number: int) -> list[dict]:
+    api_key = get_etherscan_api_key()
+    if not api_key:
+        return []
+
+    data = call_etherscan(
+        {
+            "chainid": "1",
+            "module": "proxy",
+            "action": "eth_getBlockByNumber",
+            "tag": hex(block_number),
+            "boolean": "true",
+            "apikey": api_key,
+        }
+    )
+
+    result = data.get("result")
+    if not isinstance(result, dict):
+        return []
+
+    transactions = result.get("transactions")
+    if not isinstance(transactions, list):
+        return []
+    return transactions
+
+
+def format_short_address(wallet_address: str) -> str:
+    return f"{wallet_address[:8]}...{wallet_address[-6:]}"
+
+
+def build_reason(role: str, eth_amount: float, appearances: int) -> str:
+    size_label = "sehr gross" if eth_amount >= 1000 else "gross"
+    action = "Abfluss" if role == "sender" else "Zufluss"
+    if appearances > 1:
+        return f"{size_label}er {action}, mehrfach in grossen Transfers gesehen"
+    return f"{size_label}er {action} in den letzten Blocks"
+
+
+def collect_wallet_scores(latest_block: int, min_interesting_eth: float) -> dict[tuple[str, str], dict]:
+    wallet_scores: dict[tuple[str, str], dict] = {}
+
+    for block_number in range(latest_block, latest_block - SCAN_BLOCK_COUNT, -1):
+        transactions = fetch_block_transactions(block_number)
+        for tx in transactions:
+            if str(tx.get("input", "")) != "0x":
+                continue
+
+            value_hex = tx.get("value")
+            from_address = str(tx.get("from", ""))
+            to_address = str(tx.get("to", ""))
+
+            if not value_hex or not from_address or not to_address:
+                continue
+
+            value_eth = int(value_hex, 16) / 10**18
+            if value_eth < min_interesting_eth:
+                continue
+
+            sender_key = (from_address, "sender")
+            receiver_key = (to_address, "receiver")
+
+            for wallet_key, role in ((sender_key, "sender"), (receiver_key, "receiver")):
+                if wallet_key not in wallet_scores:
+                    wallet_scores[wallet_key] = {
+                        "address": wallet_key[0],
+                        "role": role,
+                        "max_eth": value_eth,
+                        "count": 1,
+                    }
+                else:
+                    wallet_scores[wallet_key]["max_eth"] = max(
+                        wallet_scores[wallet_key]["max_eth"], value_eth
+                    )
+                    wallet_scores[wallet_key]["count"] += 1
+
+    return wallet_scores
+
+
+def scan_recent_eth_activity() -> str:
+    api_key = get_etherscan_api_key()
+    if not api_key:
+        return "Fehler: ETHERSCAN_API_KEY fehlt auf dem Server."
+
+    try:
+        latest_block = fetch_latest_block_number()
+        if latest_block is None:
+            return "Fehler: Letzter Ethereum-Block konnte nicht gelesen werden."
+
+        chosen_threshold = SCAN_THRESHOLDS[-1]
+        wallet_scores: dict[tuple[str, str], dict] = {}
+        for threshold in SCAN_THRESHOLDS:
+            wallet_scores = collect_wallet_scores(latest_block, threshold)
+            chosen_threshold = threshold
+            if wallet_scores:
+                break
+
+        if not wallet_scores:
+            return "Keine interessanten grossen ETH-Transfers in den letzten Blocks gefunden."
+
+        ranked_wallets = sorted(
+            wallet_scores.values(),
+            key=lambda item: (item["max_eth"], item["count"]),
+            reverse=True,
+        )[:MAX_RESULTS]
+
+        lines = [
+            (
+                f"Scan fertig. Interessante Wallets aus den letzten "
+                f"{SCAN_BLOCK_COUNT} Blocks ab {chosen_threshold:.0f} ETH:"
+            )
+        ]
+        for index, wallet in enumerate(ranked_wallets, start=1):
+            role_text = "Sender" if wallet["role"] == "sender" else "Empfaenger"
+            reason = build_reason(wallet["role"], wallet["max_eth"], wallet["count"])
+            lines.append(
+                f"{index}. {wallet['address']} | {wallet['max_eth']:.2f} ETH | "
+                f"{role_text} | {reason}"
+            )
+        return "\n".join(lines)
+    except requests.RequestException:
+        return "Fehler: Ethereum-Scan ueber Etherscan ist fehlgeschlagen."
+    except ValueError:
+        return "Fehler: Etherscan hat ungueltige Daten fuer den Scan geliefert."
+
+
 @app.get("/")
 def read_root():
     return {"message": "Bot laeuft"}
@@ -152,6 +300,8 @@ def handle_message(msg: Message):
 
     if is_ethereum_wallet(original_text):
         return {"response": format_wallet_summary(original_text)}
+    if text == "scan":
+        return {"response": scan_recent_eth_activity()}
 
     if "hallo" in text:
         return {"response": "Hey"}
@@ -159,7 +309,8 @@ def handle_message(msg: Message):
         return {
             "response": (
                 "Schick mir eine Ethereum Wallet-Adresse und ich zeige dir "
-                "ETH Guthaben plus letzte Transaktionen."
+                "ETH Guthaben plus letzte Transaktionen. Mit scan suche ich "
+                "automatisch nach grossen ETH-Bewegungen."
             )
         }
     if "preis" in text:
