@@ -1,5 +1,6 @@
 import os
 import re
+from datetime import datetime, timezone
 
 import requests
 from fastapi import FastAPI
@@ -23,9 +24,47 @@ class Message(BaseModel):
 
 WALLET_PATTERN = re.compile(r"^0x[a-fA-F0-9]{40}$")
 ETHERSCAN_BASE_URL = "https://api.etherscan.io/v2/api"
-SCAN_BLOCK_COUNT = 5
-SCAN_THRESHOLDS = [100.0, 25.0, 10.0]
+TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+SCAN_LOOKBACK_BLOCKS = 900
+SCAN_WINDOW_SECONDS = 3 * 60 * 60
+MIN_CLUSTER_WALLETS = 3
 MAX_RESULTS = 5
+
+TRACKED_TOKENS = {
+    "ondo": {
+        "symbol": "ONDO",
+        "contract": "0xfaba6f8e4a5e8ab82f62fe7c39859fa577269be3",
+        "decimals": 18,
+        "large_threshold": 100000.0,
+        "aliases": ["ondo"],
+    },
+    "eth": {
+        "symbol": "ETH",
+        "contract": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+        "decimals": 18,
+        "large_threshold": 150.0,
+        "aliases": ["eth", "weth"],
+    },
+    "btc": {
+        "symbol": "BTC",
+        "contract": "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599",
+        "decimals": 8,
+        "large_threshold": 10.0,
+        "aliases": ["btc", "wbtc"],
+    },
+    "polygon": {
+        "symbol": "POL",
+        "contract": "0x455e53cbb86018ac2b8092fdcd39d8444affc3f6",
+        "decimals": 18,
+        "large_threshold": 500000.0,
+        "aliases": ["polygon", "matic", "pol"],
+    },
+}
+
+UNSUPPORTED_TOKENS = {
+    "sui": "SUI braucht eine eigene Sui-Datenquelle und ist in diesem Ethereum-Scanner noch Platzhalter.",
+    "plume": "PLUME braucht eine eigene Chain- oder Explorer-Anbindung und ist hier noch Platzhalter.",
+}
 
 
 def is_ethereum_wallet(text: str) -> bool:
@@ -163,7 +202,7 @@ def fetch_latest_block_number() -> int | None:
     return int(result, 16)
 
 
-def fetch_block_transactions(block_number: int) -> list[dict]:
+def fetch_token_transfer_logs(contract_address: str, from_block: int, to_block: int) -> list[dict]:
     api_key = get_etherscan_api_key()
     if not api_key:
         return []
@@ -171,22 +210,22 @@ def fetch_block_transactions(block_number: int) -> list[dict]:
     data = call_etherscan(
         {
             "chainid": "1",
-            "module": "proxy",
-            "action": "eth_getBlockByNumber",
-            "tag": hex(block_number),
-            "boolean": "true",
+            "module": "logs",
+            "action": "getLogs",
+            "fromBlock": str(from_block),
+            "toBlock": str(to_block),
+            "address": contract_address,
+            "topic0": TRANSFER_TOPIC,
+            "page": "1",
+            "offset": "200",
             "apikey": api_key,
         }
     )
 
     result = data.get("result")
-    if not isinstance(result, dict):
+    if not isinstance(result, list):
         return []
-
-    transactions = result.get("transactions")
-    if not isinstance(transactions, list):
-        return []
-    return transactions
+    return result
 
 
 def format_short_address(wallet_address: str) -> str:
@@ -201,91 +240,183 @@ def build_reason(role: str, eth_amount: float, appearances: int) -> str:
     return f"{size_label}er {action} in den letzten Blocks"
 
 
-def collect_wallet_scores(latest_block: int, min_interesting_eth: float) -> dict[tuple[str, str], dict]:
-    wallet_scores: dict[tuple[str, str], dict] = {}
-
-    for block_number in range(latest_block, latest_block - SCAN_BLOCK_COUNT, -1):
-        transactions = fetch_block_transactions(block_number)
-        for tx in transactions:
-            if str(tx.get("input", "")) != "0x":
-                continue
-
-            value_hex = tx.get("value")
-            from_address = str(tx.get("from", ""))
-            to_address = str(tx.get("to", ""))
-
-            if not value_hex or not from_address or not to_address:
-                continue
-
-            value_eth = int(value_hex, 16) / 10**18
-            if value_eth < min_interesting_eth:
-                continue
-
-            sender_key = (from_address, "sender")
-            receiver_key = (to_address, "receiver")
-
-            for wallet_key, role in ((sender_key, "sender"), (receiver_key, "receiver")):
-                if wallet_key not in wallet_scores:
-                    wallet_scores[wallet_key] = {
-                        "address": wallet_key[0],
-                        "role": role,
-                        "max_eth": value_eth,
-                        "count": 1,
-                    }
-                else:
-                    wallet_scores[wallet_key]["max_eth"] = max(
-                        wallet_scores[wallet_key]["max_eth"], value_eth
-                    )
-                    wallet_scores[wallet_key]["count"] += 1
-
-    return wallet_scores
+def parse_address_from_topic(topic: str) -> str:
+    return f"0x{topic[-40:]}".lower()
 
 
-def scan_recent_eth_activity() -> str:
+def format_window(timestamp: int) -> str:
+    window_start = timestamp - (timestamp % SCAN_WINDOW_SECONDS)
+    window_end = window_start + SCAN_WINDOW_SECONDS
+    start_text = datetime.fromtimestamp(window_start, tz=timezone.utc).strftime("%H:%M")
+    end_text = datetime.fromtimestamp(window_end, tz=timezone.utc).strftime("%H:%M")
+    return f"{start_text}-{end_text} UTC"
+
+
+def classify_signal_strength(wallet_count: int) -> str:
+    if wallet_count >= 10:
+        return "starkes"
+    if wallet_count >= 5:
+        return "solides"
+    return "fruehes"
+
+
+def build_signal_reason(signal: dict) -> str:
+    strength = classify_signal_strength(signal["wallet_count"])
+    direction_text = "akkumulieren" if signal["direction"] == "accumulation" else "verteilen"
+    return (
+        f"{signal['wallet_count']} grosse Wallets {direction_text} "
+        f"{signal['symbol']} im selben Zeitfenster, daher {strength} Cluster."
+    )
+
+
+def parse_token_transfer_event(log: dict, token: dict) -> dict | None:
+    topics = log.get("topics")
+    data_hex = log.get("data")
+    if not isinstance(topics, list) or len(topics) < 3 or not isinstance(data_hex, str):
+        return None
+
+    raw_amount = int(data_hex, 16)
+    amount = raw_amount / 10 ** token["decimals"]
+    timestamp = int(str(log.get("timeStamp", "0")), 16)
+
+    return {
+        "from": parse_address_from_topic(str(topics[1])),
+        "to": parse_address_from_topic(str(topics[2])),
+        "amount": amount,
+        "timestamp": timestamp,
+        "symbol": token["symbol"],
+    }
+
+
+def build_cluster_signals(token: dict, logs: list[dict]) -> list[dict]:
+    grouped_signals: dict[tuple[str, str, int], dict] = {}
+
+    for log in logs:
+        event = parse_token_transfer_event(log, token)
+        if event is None or event["amount"] < token["large_threshold"]:
+            continue
+
+        bucket_start = event["timestamp"] - (event["timestamp"] % SCAN_WINDOW_SECONDS)
+        directional_events = [
+            ("accumulation", event["to"]),
+            ("distribution", event["from"]),
+        ]
+
+        for direction, wallet in directional_events:
+            signal_key = (token["symbol"], direction, bucket_start)
+            if signal_key not in grouped_signals:
+                grouped_signals[signal_key] = {
+                    "symbol": token["symbol"],
+                    "direction": direction,
+                    "wallets": set(),
+                    "wallet_count": 0,
+                    "time_window": format_window(event["timestamp"]),
+                    "total_size": 0.0,
+                    "event_count": 0,
+                }
+
+            grouped_signals[signal_key]["wallets"].add(wallet)
+            grouped_signals[signal_key]["wallet_count"] = len(grouped_signals[signal_key]["wallets"])
+            grouped_signals[signal_key]["total_size"] += event["amount"]
+            grouped_signals[signal_key]["event_count"] += 1
+
+    signals = []
+    for signal in grouped_signals.values():
+        if signal["wallet_count"] < MIN_CLUSTER_WALLETS:
+            continue
+
+        signal["explanation"] = build_signal_reason(signal)
+        signal["wallets"] = list(signal["wallets"])
+        signals.append(signal)
+
+    return signals
+
+
+def resolve_scan_targets(text: str) -> tuple[list[dict], str | None]:
+    parts = text.split()
+    if len(parts) == 1:
+        return list(TRACKED_TOKENS.values()), None
+
+    requested_token = parts[1].lower()
+    if requested_token in UNSUPPORTED_TOKENS:
+        return [], UNSUPPORTED_TOKENS[requested_token]
+
+    for token in TRACKED_TOKENS.values():
+        if requested_token in token["aliases"]:
+            return [token], None
+
+    supported_names = ", ".join(token["symbol"] for token in TRACKED_TOKENS.values())
+    return [], f"Fehler: Token nicht bekannt. Unterstuetzt werden aktuell {supported_names}."
+
+
+def rank_signals(signals: list[dict], prioritized_symbol: str | None) -> list[dict]:
+    def sort_key(signal: dict) -> tuple:
+        priority_bonus = 1 if prioritized_symbol and signal["symbol"] == prioritized_symbol else 0
+        return (priority_bonus, signal["wallet_count"], signal["total_size"], signal["event_count"])
+
+    return sorted(signals, key=sort_key, reverse=True)
+
+
+def scan_whale_token_activity(text: str) -> str:
     api_key = get_etherscan_api_key()
     if not api_key:
         return "Fehler: ETHERSCAN_API_KEY fehlt auf dem Server."
+
+    tokens_to_scan, target_error = resolve_scan_targets(text)
+    if target_error:
+        return target_error
+
+    prioritized_symbol = None
+    if len(tokens_to_scan) == 1:
+        prioritized_symbol = tokens_to_scan[0]["symbol"]
 
     try:
         latest_block = fetch_latest_block_number()
         if latest_block is None:
             return "Fehler: Letzter Ethereum-Block konnte nicht gelesen werden."
 
-        chosen_threshold = SCAN_THRESHOLDS[-1]
-        wallet_scores: dict[tuple[str, str], dict] = {}
-        for threshold in SCAN_THRESHOLDS:
-            wallet_scores = collect_wallet_scores(latest_block, threshold)
-            chosen_threshold = threshold
-            if wallet_scores:
-                break
+        from_block = max(latest_block - SCAN_LOOKBACK_BLOCKS, 0)
+        all_signals = []
 
-        if not wallet_scores:
-            return "Keine interessanten grossen ETH-Transfers in den letzten Blocks gefunden."
+        for token in tokens_to_scan:
+            logs = fetch_token_transfer_logs(token["contract"], from_block, latest_block)
+            token_signals = build_cluster_signals(token, logs)
+            all_signals.extend(token_signals)
 
-        ranked_wallets = sorted(
-            wallet_scores.values(),
-            key=lambda item: (item["max_eth"], item["count"]),
-            reverse=True,
-        )[:MAX_RESULTS]
+        if not all_signals:
+            return (
+                "Kein starkes Whale-Cluster gefunden. "
+                "Das ist echte Onchain-Logik auf Transfer-Basis, aber noch kein DEX-Buy/Sell-Beweis."
+            )
 
+        ranked_signals = rank_signals(all_signals, prioritized_symbol)[:MAX_RESULTS]
         lines = [
-            (
-                f"Scan fertig. Interessante Wallets aus den letzten "
-                f"{SCAN_BLOCK_COUNT} Blocks ab {chosen_threshold:.0f} ETH:"
-            )
+            "Scan fertig. Starke Whale-Signale aus dem letzten kurzen Zeitfenster:"
         ]
-        for index, wallet in enumerate(ranked_wallets, start=1):
-            role_text = "Sender" if wallet["role"] == "sender" else "Empfaenger"
-            reason = build_reason(wallet["role"], wallet["max_eth"], wallet["count"])
-            lines.append(
-                f"{index}. {wallet['address']} | {wallet['max_eth']:.2f} ETH | "
-                f"{role_text} | {reason}"
+        for index, signal in enumerate(ranked_signals, start=1):
+            direction_text = (
+                "accumulation" if signal["direction"] == "accumulation" else "distribution"
             )
+            lines.append(
+                f"{index}. {signal['symbol']} | {direction_text} | "
+                f"{signal['wallet_count']} Wallets | {signal['time_window']} | "
+                f"{signal['total_size']:.2f} {signal['symbol']} | {signal['explanation']}"
+            )
+
+        if prioritized_symbol:
+            lines.append(f"Priorisiert: {prioritized_symbol}")
+        else:
+            lines.append("Standard-Tracking: ONDO, ETH, BTC, POL")
+
+        lines.append(
+            "Hinweis: accumulation/distribution basiert hier auf grossen Token-Transfers, "
+            "nicht auf bestaetigten DEX-Buys oder -Sells."
+        )
         return "\n".join(lines)
     except requests.RequestException:
-        return "Fehler: Ethereum-Scan ueber Etherscan ist fehlgeschlagen."
+        return "Fehler: Token-Scan ueber Etherscan ist fehlgeschlagen."
     except ValueError:
-        return "Fehler: Etherscan hat ungueltige Daten fuer den Scan geliefert."
+        return "Fehler: Etherscan hat ungueltige Token-Daten geliefert."
 
 
 @app.get("/")
@@ -300,8 +431,8 @@ def handle_message(msg: Message):
 
     if is_ethereum_wallet(original_text):
         return {"response": format_wallet_summary(original_text)}
-    if text == "scan":
-        return {"response": scan_recent_eth_activity()}
+    if text.startswith("scan"):
+        return {"response": scan_whale_token_activity(text)}
 
     if "hallo" in text:
         return {"response": "Hey"}
@@ -310,7 +441,7 @@ def handle_message(msg: Message):
             "response": (
                 "Schick mir eine Ethereum Wallet-Adresse und ich zeige dir "
                 "ETH Guthaben plus letzte Transaktionen. Mit scan suche ich "
-                "automatisch nach grossen ETH-Bewegungen."
+                "nach Whale-Clustern fuer ONDO, ETH, BTC oder POL."
             )
         }
     if "preis" in text:
