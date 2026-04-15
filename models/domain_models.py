@@ -22,6 +22,20 @@ class TokenTransferEvent:
 
 
 @dataclass
+class MarketContext:
+    token_name: str | None = None
+    token_symbol: str | None = None
+    market_cap_rank: int | None = None
+    current_price_usd: float | None = None
+    volume_24h_usd: float | None = None
+    price_change_24h: float | None = None
+    categories: list[str] | None = None
+    market_profile: str = "unknown"
+    available: bool = False
+    limitation: str | None = None
+
+
+@dataclass
 class WhaleSignal:
     token_symbol: str
     token_name: str
@@ -36,9 +50,12 @@ class WhaleSignal:
     large_event_threshold: float
     wallet_quality_score: float
     token_relevance_score: float
+    directional_score: float
+    transfer_strength_score: float
     confidence: str
     explanation: str
     is_stablecoin: bool = False
+    market_context: MarketContext | None = None
 
 
 @dataclass

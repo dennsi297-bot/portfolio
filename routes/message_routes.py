@@ -4,6 +4,7 @@ from models.api_models import MessageRequest
 from services.message_service import MessageService
 from services.signal_engine import WhaleSignalEngine
 from services.wallet_service import WalletService
+from sources.coingecko_source import CoinGeckoSource
 from sources.etherscan_source import EtherscanSource
 
 
@@ -11,8 +12,9 @@ from sources.etherscan_source import EtherscanSource
 router = APIRouter()
 
 etherscan_source = EtherscanSource()
+coingecko_source = CoinGeckoSource()
 wallet_service = WalletService(etherscan_source)
-signal_engine = WhaleSignalEngine(etherscan_source)
+signal_engine = WhaleSignalEngine(etherscan_source, coingecko_source)
 message_service = MessageService(wallet_service, signal_engine)
 
 
