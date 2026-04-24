@@ -7,6 +7,8 @@ from models.domain_models import MarketContext
 class CoinGeckoSource:
     """Public market-data source. Used for enrichment and separate market mover mode."""
 
+    DEXSCREENER_BASE_URL = "https://api.dexscreener.com"
+
     def __init__(self) -> None:
         self._cache: dict[str, MarketContext] = {}
 
@@ -62,8 +64,14 @@ class CoinGeckoSource:
     def get_market_movers(self, limit: int = 8) -> list[dict]:
         """
         Separate price/volume mover scan.
-        This does not replace the whale scan. It only answers: what is moving now?
+        First tries CoinGecko. If CoinGecko is unavailable/rate-limited, falls back to DexScreener boosted tokens.
         """
+        movers = self._get_coingecko_market_movers(limit=limit)
+        if movers:
+            return movers
+        return self._get_dexscreener_boosted_movers(limit=limit)
+
+    def _get_coingecko_market_movers(self, limit: int = 8) -> list[dict]:
         try:
             response = requests.get(
                 f"{COINGECKO_BASE_URL}/coins/markets",
@@ -108,18 +116,88 @@ class CoinGeckoSource:
                     "volume_24h": volume,
                     "rank": rank if isinstance(rank, int) else None,
                     "market_cap": self._safe_number(coin.get("market_cap")),
+                    "source": "CoinGecko",
+                    "note": "price-volume mover",
                 }
             )
 
-        # High positive movers first. Volume is secondary so pure illiquid junk is less dominant.
-        cleaned.sort(
-            key=lambda item: (
-                item.get("change_24h") or -999,
-                item.get("volume_24h") or 0,
-            ),
-            reverse=True,
-        )
+        cleaned.sort(key=lambda item: (item.get("change_24h") or -999, item.get("volume_24h") or 0), reverse=True)
         return cleaned[:limit]
+
+    def _get_dexscreener_boosted_movers(self, limit: int = 8) -> list[dict]:
+        """
+        DexScreener fallback: not pure gainers, but actively boosted/trending tokens with pair data.
+        Useful when CoinGecko returns nothing.
+        """
+        try:
+            response = requests.get(f"{self.DEXSCREENER_BASE_URL}/token-boosts/top/v1", timeout=12)
+            response.raise_for_status()
+            boosted_payload = response.json()
+        except requests.RequestException:
+            return []
+
+        if not isinstance(boosted_payload, list):
+            return []
+
+        addresses_by_chain: dict[str, list[str]] = {}
+        for item in boosted_payload[:30]:
+            if not isinstance(item, dict):
+                continue
+            chain_id = str(item.get("chainId", "")).strip()
+            token_address = str(item.get("tokenAddress", "")).strip()
+            if not chain_id or not token_address:
+                continue
+            addresses_by_chain.setdefault(chain_id, []).append(token_address)
+
+        pair_rows: list[dict] = []
+        for chain_id, addresses in addresses_by_chain.items():
+            chunk = addresses[:30]
+            if not chunk:
+                continue
+            try:
+                pairs_response = requests.get(
+                    f"{self.DEXSCREENER_BASE_URL}/tokens/v1/{chain_id}/{','.join(chunk)}",
+                    timeout=12,
+                )
+                pairs_response.raise_for_status()
+                pairs_payload = pairs_response.json()
+            except requests.RequestException:
+                continue
+
+            if not isinstance(pairs_payload, list):
+                continue
+            for pair in pairs_payload:
+                parsed = self._parse_dex_pair(pair)
+                if parsed:
+                    pair_rows.append(parsed)
+
+        pair_rows.sort(key=lambda item: (item.get("boosts") or 0, item.get("change_24h") or -999, item.get("volume_24h") or 0), reverse=True)
+        return pair_rows[:limit]
+
+    def _parse_dex_pair(self, pair: dict) -> dict | None:
+        if not isinstance(pair, dict):
+            return None
+        base_token = pair.get("baseToken") if isinstance(pair.get("baseToken"), dict) else {}
+        symbol = str(base_token.get("symbol", "")).upper()
+        name = base_token.get("name") or symbol
+        if not symbol:
+            return None
+        volume = pair.get("volume") if isinstance(pair.get("volume"), dict) else {}
+        price_change = pair.get("priceChange") if isinstance(pair.get("priceChange"), dict) else {}
+        boosts = pair.get("boosts") if isinstance(pair.get("boosts"), dict) else {}
+        return {
+            "name": name,
+            "symbol": symbol,
+            "price": self._safe_float_string(pair.get("priceUsd")),
+            "change_24h": self._safe_number(price_change.get("h24")),
+            "volume_24h": self._safe_number(volume.get("h24")),
+            "rank": None,
+            "market_cap": self._safe_number(pair.get("marketCap")) or self._safe_number(pair.get("fdv")),
+            "source": "DexScreener",
+            "note": "boosted/trending token fallback",
+            "chain": pair.get("chainId"),
+            "boosts": self._safe_number(boosts.get("active")),
+        }
 
     @staticmethod
     def _build_headers() -> dict:
@@ -141,6 +219,17 @@ class CoinGeckoSource:
     def _safe_number(value: object) -> float | None:
         if isinstance(value, (int, float)):
             return float(value)
+        return None
+
+    @staticmethod
+    def _safe_float_string(value: object) -> float | None:
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value)
+            except ValueError:
+                return None
         return None
 
     @staticmethod
