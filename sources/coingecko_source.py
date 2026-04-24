@@ -118,11 +118,13 @@ class CoinGeckoSource:
                     "market_cap": self._safe_number(coin.get("market_cap")),
                     "source": "CoinGecko",
                     "note": "price-volume mover",
+                    "chain": "multi",
+                    "token_address": str(coin.get("id", symbol)).lower(),
                 }
             )
 
         cleaned.sort(key=lambda item: (item.get("change_24h") or -999, item.get("volume_24h") or 0), reverse=True)
-        return cleaned[:limit]
+        return self._dedupe_movers(cleaned)[:limit]
 
     def _get_dexscreener_boosted_movers(self, limit: int = 8) -> list[dict]:
         """
@@ -172,7 +174,7 @@ class CoinGeckoSource:
                     pair_rows.append(parsed)
 
         pair_rows.sort(key=lambda item: (item.get("boosts") or 0, item.get("change_24h") or -999, item.get("volume_24h") or 0), reverse=True)
-        return pair_rows[:limit]
+        return self._dedupe_movers(pair_rows)[:limit]
 
     def _parse_dex_pair(self, pair: dict) -> dict | None:
         if not isinstance(pair, dict):
@@ -180,6 +182,7 @@ class CoinGeckoSource:
         base_token = pair.get("baseToken") if isinstance(pair.get("baseToken"), dict) else {}
         symbol = str(base_token.get("symbol", "")).upper()
         name = base_token.get("name") or symbol
+        token_address = str(base_token.get("address", "")).strip()
         if not symbol:
             return None
         volume = pair.get("volume") if isinstance(pair.get("volume"), dict) else {}
@@ -197,7 +200,27 @@ class CoinGeckoSource:
             "note": "boosted/trending token fallback",
             "chain": pair.get("chainId"),
             "boosts": self._safe_number(boosts.get("active")),
+            "token_address": token_address,
+            "pair_url": pair.get("url"),
         }
+
+    @staticmethod
+    def _dedupe_movers(movers: list[dict]) -> list[dict]:
+        best_by_key: dict[str, dict] = {}
+        for mover in movers:
+            symbol = str(mover.get("symbol", "")).upper()
+            chain = str(mover.get("chain", "")).lower()
+            token_address = str(mover.get("token_address", "")).lower()
+            key = token_address or f"{chain}:{symbol}:{str(mover.get('name', '')).lower()}"
+            current = best_by_key.get(key)
+            if current is None:
+                best_by_key[key] = mover
+                continue
+            current_score = (current.get("boosts") or 0, current.get("change_24h") or -999, current.get("volume_24h") or 0)
+            mover_score = (mover.get("boosts") or 0, mover.get("change_24h") or -999, mover.get("volume_24h") or 0)
+            if mover_score > current_score:
+                best_by_key[key] = mover
+        return list(best_by_key.values())
 
     @staticmethod
     def _build_headers() -> dict:
