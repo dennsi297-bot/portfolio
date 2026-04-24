@@ -3,6 +3,8 @@ import math
 import requests
 
 from config.settings import (
+    BASE_CONTEXT_SYMBOLS,
+    BLACKLIST_SYMBOLS,
     COINGECKO_ENRICH_LIMIT,
     DEPRIORITIZED_MAJOR_SYMBOLS,
     LARGE_EVENT_PERCENTILE,
@@ -15,6 +17,7 @@ from config.settings import (
     SCAN_WINDOW_SECONDS,
     STABLECOIN_SYMBOLS,
     UNSUPPORTED_SCAN_TERMS,
+    WATCHLIST_SYMBOLS,
 )
 from models.domain_models import MarketContext, ScanDiagnostics, TokenMetadata, TokenTransferEvent, WhaleSignal
 from sources.coingecko_source import CoinGeckoSource
@@ -25,8 +28,12 @@ from utils.text_utils import format_time_window, parse_address_from_topic
 
 class WhaleSignalEngine:
     """
-    Real transfer-based whale scanner with market enrichment added afterward.
-    Scanner remains signal-first; market data is only context and ranking help.
+    Signal-first whale scanner.
+
+    Core job:
+    - scan broad Ethereum ERC-20 transfer logs
+    - find several large wallets accumulating or distributing the same coin in the same time window
+    - separate real altcoin opportunities from market context/noise
     """
 
     def __init__(
@@ -81,14 +88,14 @@ class WhaleSignalEngine:
             if not raw_signals:
                 return (
                     "Kein starkes Whale-Cluster gefunden. "
-                    "Der Scan ist echt breit ueber ERC-20 Transfers, aber das aktuelle Sample zeigt nichts Starkes."
+                    "Der Scan ist breit ueber ERC-20 Transfers, aber das aktuelle Sample zeigt nichts Starkes."
                 )
 
             cleaned_signals = self._discard_conflicted_signals(raw_signals)
             if not cleaned_signals:
                 return (
                     "Kein starkes einseitiges Whale-Cluster gefunden. "
-                    "Tokens mit gleich starker accumulation und distribution wurden bewusst verworfen."
+                    "Tokens mit accumulation und distribution im selben Fenster wurden als mixed_flow verworfen."
                 )
 
             transfer_ranked = self._rank_by_transfer_strength(cleaned_signals, focus_term)
@@ -101,12 +108,13 @@ class WhaleSignalEngine:
                 focus_term=focus_term,
                 source_limitations=[
                     "Transfer-Erkennung ist real und basiert auf Ethereum ERC-20 Logs.",
+                    "Gesucht wird: mehrere grosse Wallets bewegen denselben Coin im selben Zeitfenster.",
                     "CoinGecko wird nur fuer Markt-Kontext genutzt, nicht fuer die Erkennung.",
                     "Etherscan liefert hier nur eine Stichprobe, nicht den kompletten Markt.",
                     "accumulation/distribution basiert aktuell auf grossen Token-Transfers, nicht auf bestaetigten DEX-Buys oder DEX-Sells.",
                 ],
             )
-            return self._format_scan_response(final_ranked[:MAX_RESULTS], diagnostics)
+            return self._format_scan_response(final_ranked, diagnostics)
         except requests.RequestException:
             return "Fehler: Der breite Token-Scan oder Markt-Kontext-Scan ist fehlgeschlagen."
         except ValueError:
@@ -253,6 +261,7 @@ class WhaleSignalEngine:
             repeated_wallets=repeated_wallets,
             total_size=raw_window["total_size"],
             directional_score=directional_score,
+            direction=direction,
         )
         explanation = self._build_transfer_reason(
             symbol=metadata.symbol,
@@ -352,14 +361,17 @@ class WhaleSignalEngine:
         repeated_wallets: int,
         total_size: float,
         directional_score: float,
+        direction: str,
     ) -> float:
         size_component = min(5.0, math.log10(max(total_size, 1.0)))
+        direction_bonus = 5.0 if direction == "accumulation" else 0.0
         score = (
             wallet_count * 2.2
             + event_count * 0.5
             + repeated_wallets * 1.3
             + directional_score * 6.0
             + size_component
+            + direction_bonus
         )
         return round(score, 2)
 
@@ -444,8 +456,10 @@ class WhaleSignalEngine:
     def _rank_by_transfer_strength(self, signals: list[WhaleSignal], focus_term: str | None) -> list[WhaleSignal]:
         def sort_key(signal: WhaleSignal) -> tuple:
             focus_bonus = 1 if self._matches_focus(signal, focus_term) else 0
+            accumulation_bonus = 1 if signal.direction == "accumulation" else 0
             return (
                 focus_bonus,
+                accumulation_bonus,
                 signal.transfer_strength_score,
                 signal.wallet_count,
                 signal.repeated_wallets,
@@ -470,39 +484,62 @@ class WhaleSignalEngine:
 
     def _calculate_final_relevance_score(self, signal: WhaleSignal) -> float:
         score = signal.transfer_strength_score
+        symbol = signal.token_symbol.upper()
         market_context = signal.market_context
 
-        if signal.is_stablecoin:
-            score -= 6.0
-        if signal.token_symbol.upper() in DEPRIORITIZED_MAJOR_SYMBOLS:
-            score -= 5.0
+        if signal.direction == "accumulation":
+            score += 6.0
+        else:
+            score -= 2.0
+
+        if symbol in WATCHLIST_SYMBOLS:
+            score += 4.0
+        if signal.is_stablecoin or symbol in STABLECOIN_SYMBOLS:
+            score -= 15.0
+        if symbol in BASE_CONTEXT_SYMBOLS:
+            score -= 14.0
+        if symbol in BLACKLIST_SYMBOLS:
+            score -= 30.0
 
         if market_context and market_context.available:
             if market_context.market_profile == "obscure":
                 score += 2.0
             elif market_context.market_profile == "mid-cap":
-                score += 1.0
+                score += 1.5
             else:
-                score -= 1.5
+                score -= 1.0
 
             if market_context.price_change_24h is not None and abs(market_context.price_change_24h) >= 8:
                 score += 1.0
             if market_context.volume_24h_usd is not None and market_context.volume_24h_usd >= 5_000_000:
                 score += 0.8
         else:
-            score -= 0.5
+            score -= 1.0
 
         return round(score, 2)
+
+    def _classify_signal(self, signal: WhaleSignal) -> str:
+        symbol = signal.token_symbol.upper()
+        if symbol in BLACKLIST_SYMBOLS:
+            return "ignore"
+        if signal.is_stablecoin or symbol in STABLECOIN_SYMBOLS or symbol in BASE_CONTEXT_SYMBOLS:
+            return "context"
+        if signal.direction != "accumulation":
+            return "context"
+        if signal.wallet_count < MIN_CLUSTER_WALLETS:
+            return "ignore"
+        return "actionable"
 
     def _rank_signals(self, signals: list[WhaleSignal], focus_term: str | None) -> list[WhaleSignal]:
         def sort_key(signal: WhaleSignal) -> tuple:
             focus_bonus = 1 if self._matches_focus(signal, focus_term) else 0
-            major_wrapped_penalty = 0 if signal.token_symbol.upper() in DEPRIORITIZED_MAJOR_SYMBOLS else 1
-            stablecoin_penalty = 0 if signal.is_stablecoin else 1
+            classification = self._classify_signal(signal)
+            class_score = {"actionable": 3, "context": 2, "ignore": 1}.get(classification, 0)
+            accumulation_bonus = 1 if signal.direction == "accumulation" else 0
             return (
                 focus_bonus,
-                stablecoin_penalty,
-                major_wrapped_penalty,
+                class_score,
+                accumulation_bonus,
                 signal.token_relevance_score,
                 signal.wallet_count,
                 signal.event_count,
@@ -520,17 +557,25 @@ class WhaleSignalEngine:
             stronger_parts.append(f"{signal.repeated_wallets} Wallets mehrfach aktiv")
 
         weaker_parts = []
-        if signal.is_stablecoin:
-            weaker_parts.append("Stablecoin-Signal wird bewusst runtergestuft")
-        if signal.token_symbol.upper() in DEPRIORITIZED_MAJOR_SYMBOLS:
-            weaker_parts.append("major wrapped asset wird bewusst runtergestuft")
+        symbol = signal.token_symbol.upper()
+        if signal.is_stablecoin or symbol in STABLECOIN_SYMBOLS:
+            weaker_parts.append("Stablecoin = Market Context, kein Altcoin-Trigger")
+        if symbol in BASE_CONTEXT_SYMBOLS:
+            weaker_parts.append("Base-/Wrapped-Asset = Market Context")
+        if symbol in BLACKLIST_SYMBOLS:
+            weaker_parts.append("Token steht auf Blacklist")
         if signal.market_context and not signal.market_context.available:
             weaker_parts.append("Markt-Kontext aktuell nicht verfuegbar")
 
         weaker_text = f" Schwaecher: {', '.join(weaker_parts)}." if weaker_parts else ""
+        action_text = (
+            "Das ist ein Akkumulations-Cluster: mehrere grosse Wallets sammeln denselben Coin gleichzeitig."
+            if signal.direction == "accumulation"
+            else "Das ist Verteilungs-/Abfluss-Kontext, kein Kauf-Trigger."
+        )
         return (
             f"Interessant wegen {', '.join(stronger_parts)}. "
-            f"Jetzt relevant, weil das Cluster im selben Zeitfenster klar einseitig ist."
+            f"{action_text}"
             f"{weaker_text}"
         ).strip()
 
@@ -568,23 +613,49 @@ class WhaleSignalEngine:
             f"change24h {change_text}, profile {market_context.market_profile}, narrative {categories}."
         )
 
-    def _format_scan_response(self, signals: list[WhaleSignal], diagnostics: ScanDiagnostics) -> str:
-        lines = [
-            "Scan fertig. Top Whale-Signale aus der aktuellen Ethereum-Transfer-Stichprobe:",
+    def _format_signal_line(self, index: int, signal: WhaleSignal, classification: str) -> list[str]:
+        name = signal.token_name or signal.token_symbol
+        symbol = signal.token_symbol.upper()
+        identity = "high" if signal.market_context and signal.market_context.available else "medium"
+        market_note = self._format_market_note(signal.market_context)
+        return [
+            f"{index}. {name} ({symbol}) | {signal.token_contract} | {signal.direction} | "
+            f"{signal.wallet_count} Wallets | {signal.event_count} Events | "
+            f"{signal.total_size:.2f} {symbol} | {signal.time_window} | confidence {signal.confidence}",
+            f"   Classification: {classification} | Evidence: transfer-based | Identity: {identity}",
+            f"   Transfer-Erkennung: real | {signal.explanation}",
+            f"   Markt-Enrichment: {'real' if signal.market_context and signal.market_context.available else 'unavailable'} | {market_note}",
         ]
 
-        for index, signal in enumerate(signals, start=1):
-            lines.append(
-                f"{index}. {signal.token_symbol} | {signal.token_contract} | {signal.direction} | "
-                f"{signal.wallet_count} Wallets | {signal.event_count} Events | "
-                f"{signal.total_size:.2f} {signal.token_symbol} | {signal.time_window} | "
-                f"confidence {signal.confidence}"
-            )
-            lines.append(f"   Transfer-Erkennung: real | {signal.explanation}")
-            lines.append(
-                f"   Markt-Enrichment: {'real' if signal.market_context and signal.market_context.available else 'unavailable'} | "
-                f"{self._format_market_note(signal.market_context)}"
-            )
+    def _format_scan_response(self, signals: list[WhaleSignal], diagnostics: ScanDiagnostics) -> str:
+        actionable = [signal for signal in signals if self._classify_signal(signal) == "actionable"]
+        context = [signal for signal in signals if self._classify_signal(signal) == "context"]
+        ignored = [signal for signal in signals if self._classify_signal(signal) == "ignore"]
+
+        lines = [
+            "Scan fertig. Mehrere grosse Wallets gleichzeitig erkannt:",
+            "Top Altcoin Opportunities:",
+        ]
+
+        if actionable:
+            for index, signal in enumerate(actionable[:MAX_RESULTS], start=1):
+                lines.extend(self._format_signal_line(index, signal, "actionable"))
+        else:
+            lines.append("Keine starken Altcoin-Akkumulationscluster im aktuellen Scan-Fenster gefunden.")
+
+        lines.append("Market Context:")
+        if context:
+            for index, signal in enumerate(context[:MAX_RESULTS], start=1):
+                lines.extend(self._format_signal_line(index, signal, "context_only"))
+        else:
+            lines.append("Kein relevanter Market Context im aktuellen Scan-Fenster gefunden.")
+
+        lines.append("Filtered / Ignored:")
+        if ignored:
+            for index, signal in enumerate(ignored[:MAX_RESULTS], start=1):
+                lines.extend(self._format_signal_line(index, signal, "ignore"))
+        else:
+            lines.append("Keine ignorierten Signale im aktuellen Scan-Fenster.")
 
         if diagnostics.focus_term:
             if any(self._matches_focus(signal, diagnostics.focus_term) for signal in signals):
