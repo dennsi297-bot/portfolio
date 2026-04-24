@@ -15,13 +15,57 @@ MARKET_LOG_PAGES = 2
 MARKET_LOG_PAGE_SIZE = 1000
 MIN_CLUSTER_WALLETS = 5
 MIN_TOKEN_EVENTS = 4
-MAX_METADATA_TOKENS = 25
+MAX_METADATA_TOKENS = 35
 LARGE_EVENT_PERCENTILE = 0.8
 MAX_RESULTS = 3
-COINGECKO_ENRICH_LIMIT = 10
+COINGECKO_ENRICH_LIMIT = 18
 
-STABLECOIN_SYMBOLS = {"USDT", "USDC", "DAI", "USDE", "USDS", "FDUSD", "PYUSD", "TUSD", "RLUSD"}
-DEPRIORITIZED_MAJOR_SYMBOLS = {"WETH", "WBTC"}
+STABLECOIN_SYMBOLS = {
+    "USDT",
+    "USDC",
+    "DAI",
+    "USDE",
+    "USDS",
+    "FDUSD",
+    "PYUSD",
+    "TUSD",
+    "RLUSD",
+    "USDD",
+    "FRAX",
+}
+
+BASE_CONTEXT_SYMBOLS = {
+    "ETH",
+    "WETH",
+    "BTC",
+    "WBTC",
+    "LBTC",
+    "CBBTC",
+    "TBTC",
+    "RENBTC",
+}
+
+# Tokens that are too misleading/noisy for an "opportunity" card.
+# They can still be seen in raw output if needed, but not as actionable alpha.
+BLACKLIST_SYMBOLS = {
+    "HEX",
+}
+
+# Optional priority terms. The scanner remains broad/signal-first, but these
+# symbols get a small score bump if they are detected naturally in the sample.
+WATCHLIST_SYMBOLS = {
+    "ONDO",
+    "LINK",
+    "GRT",
+    "CFG",
+    "PLUME",
+    "FET",
+    "NEAR",
+    "PENDLE",
+    "ETHFI",
+}
+
+DEPRIORITIZED_MAJOR_SYMBOLS = BASE_CONTEXT_SYMBOLS | STABLECOIN_SYMBOLS
 UNSUPPORTED_SCAN_TERMS = {
     "sui": "SUI braucht eine eigene Sui-Datenquelle. Der aktuelle breite Scan deckt nur Ethereum ERC-20 Aktivitaet ab.",
     "plume": "PLUME braucht eine eigene Plume- oder EVM-Datenquelle. Der aktuelle breite Scan deckt nur Ethereum ERC-20 Aktivitaet ab.",
