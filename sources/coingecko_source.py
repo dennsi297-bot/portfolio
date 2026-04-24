@@ -5,7 +5,7 @@ from models.domain_models import MarketContext
 
 
 class CoinGeckoSource:
-    """Public market-data enrichment source. Used after transfer-based detection, never before."""
+    """Public market-data source. Used for enrichment and separate market mover mode."""
 
     def __init__(self) -> None:
         self._cache: dict[str, MarketContext] = {}
@@ -59,6 +59,68 @@ class CoinGeckoSource:
         self._cache[contract_address] = context
         return context
 
+    def get_market_movers(self, limit: int = 8) -> list[dict]:
+        """
+        Separate price/volume mover scan.
+        This does not replace the whale scan. It only answers: what is moving now?
+        """
+        try:
+            response = requests.get(
+                f"{COINGECKO_BASE_URL}/coins/markets",
+                headers=self._build_headers(),
+                params={
+                    "vs_currency": "usd",
+                    "order": "volume_desc",
+                    "per_page": 100,
+                    "page": 1,
+                    "sparkline": "false",
+                    "price_change_percentage": "1h,24h,7d",
+                },
+                timeout=12,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except requests.RequestException:
+            return []
+
+        if not isinstance(payload, list):
+            return []
+
+        cleaned: list[dict] = []
+        for coin in payload:
+            if not isinstance(coin, dict):
+                continue
+            symbol = str(coin.get("symbol", "")).upper()
+            if not symbol:
+                continue
+            change_24h = self._safe_number(coin.get("price_change_percentage_24h"))
+            volume = self._safe_number(coin.get("total_volume"))
+            price = self._safe_number(coin.get("current_price"))
+            rank = coin.get("market_cap_rank")
+            if change_24h is None:
+                continue
+            cleaned.append(
+                {
+                    "name": coin.get("name") or symbol,
+                    "symbol": symbol,
+                    "price": price,
+                    "change_24h": change_24h,
+                    "volume_24h": volume,
+                    "rank": rank if isinstance(rank, int) else None,
+                    "market_cap": self._safe_number(coin.get("market_cap")),
+                }
+            )
+
+        # High positive movers first. Volume is secondary so pure illiquid junk is less dominant.
+        cleaned.sort(
+            key=lambda item: (
+                item.get("change_24h") or -999,
+                item.get("volume_24h") or 0,
+            ),
+            reverse=True,
+        )
+        return cleaned[:limit]
+
     @staticmethod
     def _build_headers() -> dict:
         api_key = get_coingecko_api_key()
@@ -73,8 +135,12 @@ class CoinGeckoSource:
             if not isinstance(current, dict) or key not in current:
                 return None
             current = current[key]
-        if isinstance(current, (int, float)):
-            return float(current)
+        return CoinGeckoSource._safe_number(current)
+
+    @staticmethod
+    def _safe_number(value: object) -> float | None:
+        if isinstance(value, (int, float)):
+            return float(value)
         return None
 
     @staticmethod
