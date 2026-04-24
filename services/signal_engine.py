@@ -31,6 +31,9 @@ class WhaleSignalEngine:
         self.market_source = market_source or CoinGeckoSource()
 
     def scan(self, user_text: str) -> str:
+        if user_text.strip().lower() in {"scan gainers", "scan movers", "scan market", "market", "gainers"}:
+            return self.scan_market_movers()
+
         if not self.source.has_api_key():
             return "Fehler: ETHERSCAN_API_KEY fehlt auf dem Server."
 
@@ -102,6 +105,43 @@ class WhaleSignalEngine:
         except ValueError:
             return "Fehler: Eine Datenquelle hat ungueltige Daten fuer den Scan geliefert."
 
+    def scan_market_movers(self) -> str:
+        movers = self.market_source.get_market_movers(limit=8)
+        if not movers:
+            return "Market Movers: Keine CoinGecko-Gainer-Daten erreichbar. Der normale scan bleibt unveraendert."
+
+        lines = [
+            "Market Movers fertig. Separater Preis-/Volumen-Zusatzscan:",
+            "Market Movers:",
+        ]
+        for index, mover in enumerate(movers, start=1):
+            name = mover.get("name") or mover.get("symbol") or "Unknown"
+            symbol = mover.get("symbol") or "n/a"
+            price = mover.get("price")
+            change = mover.get("change_24h")
+            volume = mover.get("volume_24h")
+            rank = mover.get("rank")
+            price_text = f"${price:.6f}" if isinstance(price, (int, float)) else "n/a"
+            change_text = f"{change:.2f}%" if isinstance(change, (int, float)) else "n/a"
+            volume_text = f"${volume:,.0f}" if isinstance(volume, (int, float)) else "n/a"
+            rank_text = str(rank) if isinstance(rank, int) else "n/a"
+            lines.extend(
+                [
+                    f"{index}. {name} ({symbol}) | market_mover | price {price_text} | change24h {change_text} | volume24h {volume_text} | rank {rank_text}",
+                    "   Classification: market_mover | Evidence: market-data | Identity: high",
+                    "   Bewertung: market-only pump. Whale-Bestaetigung wurde in diesem Zusatzmodus nicht behauptet.",
+                ]
+            )
+        lines.extend(
+            [
+                "Notes:",
+                "Dieser Modus veraendert den normalen Whale-Cluster-Scan nicht.",
+                "Market Movers zeigen Preis-/Volumenbewegungen, nicht automatisch Whale-Akkumulation.",
+                "Naechster sinnvoller Schritt spaeter: Market Movers gegen Whale-Cluster querpruefen.",
+            ]
+        )
+        return "\n".join(lines)
+
     def _parse_focus_term(self, text: str) -> tuple[str | None, str | None]:
         parts = text.split(maxsplit=1)
         if len(parts) == 1:
@@ -147,29 +187,20 @@ class WhaleSignalEngine:
                 parsed_events.append(event)
         if len(parsed_events) < MIN_TOKEN_EVENTS:
             return []
-
         threshold = self._calculate_large_event_threshold([event.amount for event in parsed_events])
         if threshold is None or threshold <= 0:
             return []
-
         grouped_windows: dict[int, dict] = {}
         for event in parsed_events:
             if event.amount < threshold:
                 continue
             bucket_start = event.timestamp - (event.timestamp % SCAN_WINDOW_SECONDS)
             if bucket_start not in grouped_windows:
-                grouped_windows[bucket_start] = {
-                    "sender_counts": {},
-                    "receiver_counts": {},
-                    "event_count": 0,
-                    "total_size": 0.0,
-                    "time_window": format_time_window(event.timestamp, SCAN_WINDOW_SECONDS),
-                }
+                grouped_windows[bucket_start] = {"sender_counts": {}, "receiver_counts": {}, "event_count": 0, "total_size": 0.0, "time_window": format_time_window(event.timestamp, SCAN_WINDOW_SECONDS)}
             grouped_windows[bucket_start]["sender_counts"][event.from_address] = grouped_windows[bucket_start]["sender_counts"].get(event.from_address, 0) + 1
             grouped_windows[bucket_start]["receiver_counts"][event.to_address] = grouped_windows[bucket_start]["receiver_counts"].get(event.to_address, 0) + 1
             grouped_windows[bucket_start]["event_count"] += 1
             grouped_windows[bucket_start]["total_size"] += event.amount
-
         signals: list[WhaleSignal] = []
         for window_data in grouped_windows.values():
             sender_counts = window_data["sender_counts"]
@@ -184,15 +215,7 @@ class WhaleSignalEngine:
                 signals.append(distribution_signal)
         return signals
 
-    def _build_direction_signal(
-        self,
-        metadata: TokenMetadata,
-        direction: str,
-        primary_counts: dict[str, int],
-        counter_counts: dict[str, int],
-        raw_window: dict,
-        threshold: float,
-    ) -> WhaleSignal | None:
+    def _build_direction_signal(self, metadata: TokenMetadata, direction: str, primary_counts: dict[str, int], counter_counts: dict[str, int], raw_window: dict, threshold: float) -> WhaleSignal | None:
         wallet_addresses = list(primary_counts.keys())
         wallet_count = len(wallet_addresses)
         counter_wallet_count = len(counter_counts)
@@ -200,31 +223,9 @@ class WhaleSignalEngine:
         counter_repeated_wallets = sum(1 for count in counter_counts.values() if count > 1)
         if not self._is_strong_direction(wallet_count, counter_wallet_count, repeated_wallets, counter_repeated_wallets):
             return None
-
         directional_score = self._calculate_directional_score(wallet_count, counter_wallet_count)
-        transfer_strength_score = self._calculate_transfer_strength_score(
-            wallet_count, raw_window["event_count"], repeated_wallets, raw_window["total_size"], directional_score, direction
-        )
-        return WhaleSignal(
-            token_symbol=metadata.symbol,
-            token_name=metadata.name,
-            token_contract=metadata.contract,
-            direction=direction,
-            wallet_addresses=wallet_addresses,
-            wallet_count=wallet_count,
-            repeated_wallets=repeated_wallets,
-            event_count=raw_window["event_count"],
-            total_size=raw_window["total_size"],
-            time_window=raw_window["time_window"],
-            large_event_threshold=threshold,
-            wallet_quality_score=self._calculate_wallet_quality_score(primary_counts),
-            token_relevance_score=transfer_strength_score,
-            directional_score=directional_score,
-            transfer_strength_score=transfer_strength_score,
-            confidence=self._confidence_from_score(transfer_strength_score),
-            explanation=self._build_transfer_reason(metadata.symbol, direction, wallet_count, repeated_wallets, directional_score),
-            is_stablecoin=metadata.is_stablecoin,
-        )
+        transfer_strength_score = self._calculate_transfer_strength_score(wallet_count, raw_window["event_count"], repeated_wallets, raw_window["total_size"], directional_score, direction)
+        return WhaleSignal(token_symbol=metadata.symbol, token_name=metadata.name, token_contract=metadata.contract, direction=direction, wallet_addresses=wallet_addresses, wallet_count=wallet_count, repeated_wallets=repeated_wallets, event_count=raw_window["event_count"], total_size=raw_window["total_size"], time_window=raw_window["time_window"], large_event_threshold=threshold, wallet_quality_score=self._calculate_wallet_quality_score(primary_counts), token_relevance_score=transfer_strength_score, directional_score=directional_score, transfer_strength_score=transfer_strength_score, confidence=self._confidence_from_score(transfer_strength_score), explanation=self._build_transfer_reason(metadata.symbol, direction, wallet_count, repeated_wallets, directional_score), is_stablecoin=metadata.is_stablecoin)
 
     @staticmethod
     def _parse_token_event(log: dict, metadata: TokenMetadata) -> TokenTransferEvent | None:
@@ -243,21 +244,11 @@ class WhaleSignalEngine:
         from_address = parse_address_from_topic(str(topics[1]))
         to_address = parse_address_from_topic(str(topics[2]))
         zero_address = "0x0000000000000000000000000000000000000000"
-        if from_address == to_address:
-            return None
-        if from_address == zero_address or to_address == zero_address:
+        if from_address == to_address or from_address == zero_address or to_address == zero_address:
             return None
         if from_address == metadata.contract or to_address == metadata.contract:
             return None
-        return TokenTransferEvent(
-            contract=metadata.contract,
-            symbol=metadata.symbol,
-            name=metadata.name,
-            from_address=from_address,
-            to_address=to_address,
-            amount=raw_amount / (10 ** metadata.decimals),
-            timestamp=timestamp,
-        )
+        return TokenTransferEvent(contract=metadata.contract, symbol=metadata.symbol, name=metadata.name, from_address=from_address, to_address=to_address, amount=raw_amount / (10 ** metadata.decimals), timestamp=timestamp)
 
     @staticmethod
     def _calculate_large_event_threshold(amounts: list[float]) -> float | None:
@@ -284,8 +275,7 @@ class WhaleSignalEngine:
     def _calculate_transfer_strength_score(wallet_count: int, event_count: int, repeated_wallets: int, total_size: float, directional_score: float, direction: str) -> float:
         size_component = min(5.0, math.log10(max(total_size, 1.0)))
         direction_bonus = 5.0 if direction == "accumulation" else 0.0
-        score = wallet_count * 2.2 + event_count * 0.5 + repeated_wallets * 1.3 + directional_score * 6.0 + size_component + direction_bonus
-        return round(score, 2)
+        return round(wallet_count * 2.2 + event_count * 0.5 + repeated_wallets * 1.3 + directional_score * 6.0 + size_component + direction_bonus, 2)
 
     @staticmethod
     def _confidence_from_score(score: float) -> str:
@@ -367,7 +357,7 @@ class WhaleSignalEngine:
         if symbol in WATCHLIST_SYMBOLS:
             score += 4.0
         if signal.is_stablecoin or symbol in STABLECOIN_SYMBOLS:
-            score -= 3.0  # Important context, but not an altcoin opportunity.
+            score -= 3.0
         if symbol in BASE_CONTEXT_SYMBOLS:
             score -= 8.0
         if symbol in BLACKLIST_SYMBOLS:
@@ -467,12 +457,7 @@ class WhaleSignalEngine:
         symbol = signal.token_symbol.upper()
         identity = "high" if self._has_trusted_identity(signal) else "medium"
         market_note = self._format_market_note(signal.market_context)
-        return [
-            f"{index}. {name} ({symbol}) | {signal.token_contract} | {signal.direction} | {signal.wallet_count} Wallets | {signal.event_count} Events | {signal.total_size:.2f} {symbol} | {signal.time_window} | confidence {signal.confidence}",
-            f"   Classification: {classification} | Evidence: transfer-based | Identity: {identity}",
-            f"   Transfer-Erkennung: real | {signal.explanation}",
-            f"   Markt-Enrichment: {'real' if signal.market_context and signal.market_context.available else 'unavailable'} | {market_note}",
-        ]
+        return [f"{index}. {name} ({symbol}) | {signal.token_contract} | {signal.direction} | {signal.wallet_count} Wallets | {signal.event_count} Events | {signal.total_size:.2f} {symbol} | {signal.time_window} | confidence {signal.confidence}", f"   Classification: {classification} | Evidence: transfer-based | Identity: {identity}", f"   Transfer-Erkennung: real | {signal.explanation}", f"   Markt-Enrichment: {'real' if signal.market_context and signal.market_context.available else 'unavailable'} | {market_note}"]
 
     @staticmethod
     def _summary_window(signals: list[WhaleSignal]) -> str:
@@ -487,18 +472,7 @@ class WhaleSignalEngine:
         actionable = [signal for signal in signals if self._classify_signal(signal) == "actionable"]
         context = [signal for signal in signals if self._classify_signal(signal) == "context"]
         ignored = [signal for signal in signals if self._classify_signal(signal) == "ignore"]
-        lines = [
-            "Scan fertig. Mehrere grosse Wallets gleichzeitig erkannt:",
-            "Scan Summary:",
-            f"Events scanned: {diagnostics.sampled_logs}",
-            f"Zeitraum: {self._summary_window(signals)}",
-            f"Gefundene Cluster: {len(signals)}",
-            f"Top Opportunities: {len(actionable)}",
-            f"Context Signals: {len(context)}",
-            f"Ignored Signals: {len(ignored)}",
-            "Filter-Modus: strict",
-            "Top Altcoin Opportunities:",
-        ]
+        lines = ["Scan fertig. Mehrere grosse Wallets gleichzeitig erkannt:", "Scan Summary:", f"Events scanned: {diagnostics.sampled_logs}", f"Zeitraum: {self._summary_window(signals)}", f"Gefundene Cluster: {len(signals)}", f"Top Opportunities: {len(actionable)}", f"Context Signals: {len(context)}", f"Ignored Signals: {len(ignored)}", "Filter-Modus: strict", "Top Altcoin Opportunities:"]
         if actionable:
             for index, signal in enumerate(actionable[:MAX_RESULTS], start=1):
                 lines.extend(self._format_signal_line(index, signal, "actionable"))
