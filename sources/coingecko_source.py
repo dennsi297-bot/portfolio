@@ -1,7 +1,6 @@
-import requests
-
 from config.settings import COINGECKO_BASE_URL, get_coingecko_api_key
 from models.domain_models import MarketContext
+from utils.http_client import ExternalAPIError, get_json_with_retry
 
 
 class CoinGeckoSource:
@@ -11,6 +10,25 @@ class CoinGeckoSource:
 
     def __init__(self) -> None:
         self._cache: dict[str, MarketContext] = {}
+        self.source_status: dict[str, str] = {
+            "CoinGecko": "not_used",
+            "DexScreener": "not_used",
+        }
+        self.last_errors: list[str] = []
+
+    def reset_status(self) -> None:
+        self.source_status = {
+            "CoinGecko": "not_used",
+            "DexScreener": "not_used",
+        }
+        self.last_errors = []
+
+    def _mark_ok(self, source: str) -> None:
+        self.source_status[source] = "ok"
+
+    def _mark_error(self, exc: ExternalAPIError) -> None:
+        self.source_status[exc.source] = exc.kind
+        self.last_errors.append(str(exc))
 
     def get_market_context(self, contract_address: str) -> MarketContext:
         contract_address = contract_address.lower()
@@ -18,8 +36,9 @@ class CoinGeckoSource:
             return self._cache[contract_address]
 
         try:
-            response = requests.get(
+            payload = get_json_with_retry(
                 f"{COINGECKO_BASE_URL}/coins/ethereum/contract/{contract_address}",
+                source="CoinGecko",
                 headers=self._build_headers(),
                 params={
                     "localization": "false",
@@ -29,18 +48,13 @@ class CoinGeckoSource:
                     "developer_data": "false",
                     "sparkline": "false",
                 },
-                timeout=10,
+                timeout=12,
+                retries=2,
             )
-            if response.status_code == 404:
-                context = MarketContext(
-                    available=False,
-                    limitation="CoinGecko mapping fuer diesen Contract nicht gefunden.",
-                )
-                self._cache[contract_address] = context
-                return context
+            self._mark_ok("CoinGecko")
+            if not isinstance(payload, dict):
+                raise ExternalAPIError("CoinGecko", "invalid_payload", "Response was not an object", 1)
 
-            response.raise_for_status()
-            payload = response.json()
             context = MarketContext(
                 token_name=payload.get("name"),
                 token_symbol=str(payload.get("symbol", "")).upper() or None,
@@ -52,11 +66,18 @@ class CoinGeckoSource:
                 market_profile=self._classify_profile(payload.get("market_cap_rank")),
                 available=True,
             )
-        except requests.RequestException:
-            context = MarketContext(
-                available=False,
-                limitation="CoinGecko Markt-Kontext momentan nicht erreichbar.",
-            )
+        except ExternalAPIError as exc:
+            self._mark_error(exc)
+            if "HTTP 404" in exc.message:
+                context = MarketContext(
+                    available=False,
+                    limitation="CoinGecko mapping fuer diesen Contract nicht gefunden.",
+                )
+            else:
+                context = MarketContext(
+                    available=False,
+                    limitation=f"CoinGecko Markt-Kontext momentan nicht erreichbar ({exc.kind}).",
+                )
 
         self._cache[contract_address] = context
         return context
@@ -73,8 +94,9 @@ class CoinGeckoSource:
 
     def _get_coingecko_market_movers(self, limit: int = 8) -> list[dict]:
         try:
-            response = requests.get(
+            payload = get_json_with_retry(
                 f"{COINGECKO_BASE_URL}/coins/markets",
+                source="CoinGecko",
                 headers=self._build_headers(),
                 params={
                     "vs_currency": "usd",
@@ -85,13 +107,15 @@ class CoinGeckoSource:
                     "price_change_percentage": "1h,24h,7d",
                 },
                 timeout=12,
+                retries=2,
             )
-            response.raise_for_status()
-            payload = response.json()
-        except requests.RequestException:
+            self._mark_ok("CoinGecko")
+        except ExternalAPIError as exc:
+            self._mark_error(exc)
             return []
 
         if not isinstance(payload, list):
+            self.source_status["CoinGecko"] = "invalid_payload"
             return []
 
         cleaned: list[dict] = []
@@ -132,13 +156,19 @@ class CoinGeckoSource:
         Useful when CoinGecko returns nothing.
         """
         try:
-            response = requests.get(f"{self.DEXSCREENER_BASE_URL}/token-boosts/top/v1", timeout=12)
-            response.raise_for_status()
-            boosted_payload = response.json()
-        except requests.RequestException:
+            boosted_payload = get_json_with_retry(
+                f"{self.DEXSCREENER_BASE_URL}/token-boosts/top/v1",
+                source="DexScreener",
+                timeout=12,
+                retries=2,
+            )
+            self._mark_ok("DexScreener")
+        except ExternalAPIError as exc:
+            self._mark_error(exc)
             return []
 
         if not isinstance(boosted_payload, list):
+            self.source_status["DexScreener"] = "invalid_payload"
             return []
 
         addresses_by_chain: dict[str, list[str]] = {}
@@ -157,16 +187,19 @@ class CoinGeckoSource:
             if not chunk:
                 continue
             try:
-                pairs_response = requests.get(
+                pairs_payload = get_json_with_retry(
                     f"{self.DEXSCREENER_BASE_URL}/tokens/v1/{chain_id}/{','.join(chunk)}",
+                    source="DexScreener",
                     timeout=12,
+                    retries=2,
                 )
-                pairs_response.raise_for_status()
-                pairs_payload = pairs_response.json()
-            except requests.RequestException:
+                self._mark_ok("DexScreener")
+            except ExternalAPIError as exc:
+                self._mark_error(exc)
                 continue
 
             if not isinstance(pairs_payload, list):
+                self.source_status["DexScreener"] = "invalid_payload"
                 continue
             for pair in pairs_payload:
                 parsed = self._parse_dex_pair(pair)
