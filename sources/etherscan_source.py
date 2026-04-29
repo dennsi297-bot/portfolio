@@ -1,5 +1,3 @@
-import requests
-
 from config.settings import (
     DECIMALS_METHOD,
     ETHERSCAN_BASE_URL,
@@ -11,6 +9,7 @@ from config.settings import (
 )
 from models.domain_models import TokenMetadata
 from utils.decode_utils import decode_abi_string, decode_uint256
+from utils.http_client import ExternalAPIError, get_json_with_retry
 
 
 class EtherscanSource:
@@ -18,18 +17,33 @@ class EtherscanSource:
 
     def __init__(self) -> None:
         self._metadata_cache: dict[str, TokenMetadata] = {}
+        self.source_status: dict[str, str] = {"Etherscan": "not_used"}
+        self.last_error: str | None = None
 
     def has_api_key(self) -> bool:
         return bool(get_etherscan_api_key())
 
+    def reset_status(self) -> None:
+        self.source_status = {"Etherscan": "not_used"}
+        self.last_error = None
+
     def call(self, params: dict) -> dict:
-        response = requests.get(
-            ETHERSCAN_BASE_URL,
-            params=params,
-            timeout=10,
-        )
-        response.raise_for_status()
-        return response.json()
+        try:
+            data = get_json_with_retry(
+                ETHERSCAN_BASE_URL,
+                source="Etherscan",
+                params=params,
+                timeout=14,
+                retries=2,
+            )
+            self.source_status["Etherscan"] = "ok"
+            if not isinstance(data, dict):
+                raise ExternalAPIError("Etherscan", "invalid_payload", "Response was not an object", 1)
+            return data
+        except ExternalAPIError as exc:
+            self.source_status["Etherscan"] = exc.kind
+            self.last_error = str(exc)
+            raise
 
     def get_eth_balance(self, wallet_address: str) -> str:
         api_key = get_etherscan_api_key()
