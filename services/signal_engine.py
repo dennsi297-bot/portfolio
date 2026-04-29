@@ -1,7 +1,5 @@
 import math
 
-import requests
-
 from config.settings import (
     BASE_CONTEXT_SYMBOLS,
     BLACKLIST_SYMBOLS,
@@ -22,6 +20,7 @@ from models.domain_models import MarketContext, ScanDiagnostics, TokenMetadata, 
 from sources.coingecko_source import CoinGeckoSource
 from sources.etherscan_source import EtherscanSource
 from utils.decode_utils import decode_uint256
+from utils.http_client import ExternalAPIError
 from utils.text_utils import format_time_window, parse_address_from_topic
 
 
@@ -34,8 +33,17 @@ class WhaleSignalEngine:
         if user_text.strip().lower() in {"scan gainers", "scan movers", "scan market", "market", "gainers"}:
             return self.scan_market_movers()
 
+        if hasattr(self.source, "reset_status"):
+            self.source.reset_status()
+        if hasattr(self.market_source, "reset_status"):
+            self.market_source.reset_status()
+
         if not self.source.has_api_key():
-            return "Fehler: ETHERSCAN_API_KEY fehlt auf dem Server."
+            return self._format_failure_response(
+                "Scan fehlgeschlagen.",
+                "ETHERSCAN_API_KEY fehlt auf dem Server.",
+                "scan_failed",
+            )
 
         focus_term, limitation = self._parse_focus_term(user_text)
         if limitation:
@@ -44,17 +52,29 @@ class WhaleSignalEngine:
         try:
             latest_block = self.source.get_latest_block_number()
             if latest_block is None:
-                return "Fehler: Letzter Ethereum-Block konnte nicht gelesen werden."
+                return self._format_failure_response(
+                    "Scan fehlgeschlagen.",
+                    "Letzter Ethereum-Block konnte nicht gelesen werden.",
+                    "scan_failed",
+                )
 
             from_block = max(latest_block - SCAN_LOOKBACK_BLOCKS, 0)
             market_logs = self.source.get_market_transfer_logs(from_block, latest_block, pages=MARKET_LOG_PAGES)
             erc20_logs = self._filter_erc20_logs(market_logs)
             if not erc20_logs:
-                return "Fehler: Keine brauchbaren ERC-20 Transfer-Logs fuer den breiten Scan gefunden."
+                return self._format_failure_response(
+                    "Scan erfolgreich, aber kein Signal.",
+                    "Keine brauchbaren ERC-20 Transfer-Logs fuer den breiten Scan gefunden.",
+                    "no_signal",
+                )
 
             candidate_contracts = self._select_candidate_contracts(erc20_logs)
             if not candidate_contracts:
-                return "Keine auffaelligen Token-Cluster im aktuellen Markt-Sample gefunden."
+                return self._format_failure_response(
+                    "Scan erfolgreich, aber kein Signal.",
+                    "Keine auffaelligen Token-Cluster im aktuellen Markt-Sample gefunden.",
+                    "no_signal",
+                )
 
             logs_by_contract: dict[str, list[dict]] = {}
             for log in erc20_logs:
@@ -72,11 +92,19 @@ class WhaleSignalEngine:
                 raw_signals.extend(self._build_contract_signals(metadata, logs_by_contract.get(contract, [])))
 
             if not raw_signals:
-                return "Kein starkes Whale-Cluster im aktuellen ERC-20 Sample gefunden."
+                return self._format_failure_response(
+                    "Scan erfolgreich, aber kein Signal.",
+                    "Kein starkes Whale-Cluster im aktuellen ERC-20 Sample gefunden.",
+                    "no_signal",
+                )
 
             cleaned_signals = self._discard_conflicted_signals(raw_signals)
             if not cleaned_signals:
-                return "Kein starkes einseitiges Whale-Cluster gefunden. Mixed-flow Tokens wurden verworfen."
+                return self._format_failure_response(
+                    "Scan erfolgreich, aber kein Signal.",
+                    "Kein starkes einseitiges Whale-Cluster gefunden. Mixed-flow Tokens wurden verworfen.",
+                    "no_signal",
+                )
 
             transfer_ranked = self._rank_by_transfer_strength(cleaned_signals, focus_term)
             enrich_candidates = transfer_ranked[:COINGECKO_ENRICH_LIMIT]
@@ -100,18 +128,36 @@ class WhaleSignalEngine:
                 ],
             )
             return self._format_scan_response(display_signals, diagnostics)
-        except requests.RequestException:
-            return "Fehler: Der breite Token-Scan oder Markt-Kontext-Scan ist fehlgeschlagen."
+        except ExternalAPIError as exc:
+            return self._format_failure_response(
+                "Scan fehlgeschlagen.",
+                f"Externe Datenquelle ausgefallen oder zu langsam: {exc.source} ({exc.kind}).",
+                "api_failed",
+            )
         except ValueError:
-            return "Fehler: Eine Datenquelle hat ungueltige Daten fuer den Scan geliefert."
+            return self._format_failure_response(
+                "Scan fehlgeschlagen.",
+                "Eine Datenquelle hat ungueltige Daten fuer den Scan geliefert.",
+                "scan_failed",
+            )
 
     def scan_market_movers(self) -> str:
+        if hasattr(self.market_source, "reset_status"):
+            self.market_source.reset_status()
         movers = self.market_source.get_market_movers(limit=8)
         if not movers:
-            return "Market Movers: Keine CoinGecko-Gainer-Daten erreichbar. Der normale scan bleibt unveraendert."
+            return "\n".join(
+                [
+                    "Market Movers: Keine Market-Mover-Daten erreichbar.",
+                    *self._source_status_lines(include_etherscan=False),
+                    "Status: Teilquelle oder alle Marktquellen ausgefallen. Der normale scan bleibt unveraendert.",
+                    "Scan komplett fehlgeschlagen: Nein. Nur der Market-Mover-Zusatzmodus hat keine Daten bekommen.",
+                ]
+            )
 
         lines = [
             "Market Movers fertig. Separater Preis-/Volumen-Zusatzscan:",
+            *self._source_status_lines(include_etherscan=False),
             "Market Movers:",
         ]
         for index, mover in enumerate(movers, start=1):
@@ -121,13 +167,14 @@ class WhaleSignalEngine:
             change = mover.get("change_24h")
             volume = mover.get("volume_24h")
             rank = mover.get("rank")
+            source = mover.get("source") or "Market"
             price_text = f"${price:.6f}" if isinstance(price, (int, float)) else "n/a"
             change_text = f"{change:.2f}%" if isinstance(change, (int, float)) else "n/a"
             volume_text = f"${volume:,.0f}" if isinstance(volume, (int, float)) else "n/a"
             rank_text = str(rank) if isinstance(rank, int) else "n/a"
             lines.extend(
                 [
-                    f"{index}. {name} ({symbol}) | market_mover | price {price_text} | change24h {change_text} | volume24h {volume_text} | rank {rank_text}",
+                    f"{index}. {name} ({symbol}) | market_mover | source {source} | price {price_text} | change24h {change_text} | volume24h {volume_text} | rank {rank_text}",
                     "   Classification: market_mover | Evidence: market-data | Identity: high",
                     "   Bewertung: market-only pump. Whale-Bestaetigung wurde in diesem Zusatzmodus nicht behauptet.",
                 ]
@@ -135,12 +182,53 @@ class WhaleSignalEngine:
         lines.extend(
             [
                 "Notes:",
+                *self._source_warning_lines(),
                 "Dieser Modus veraendert den normalen Whale-Cluster-Scan nicht.",
                 "Market Movers zeigen Preis-/Volumenbewegungen, nicht automatisch Whale-Akkumulation.",
                 "Naechster sinnvoller Schritt spaeter: Market Movers gegen Whale-Cluster querpruefen.",
             ]
         )
         return "\n".join(lines)
+
+    def _source_status_lines(self, include_etherscan: bool = True) -> list[str]:
+        statuses: dict[str, str] = {}
+        if include_etherscan and hasattr(self.source, "source_status"):
+            statuses.update(self.source.source_status)
+        if hasattr(self.market_source, "source_status"):
+            statuses.update(self.market_source.source_status)
+
+        lines = ["Source Status:"]
+        ordered = ["Etherscan", "CoinGecko", "DexScreener"] if include_etherscan else ["CoinGecko", "DexScreener"]
+        for name in ordered:
+            if name in statuses:
+                lines.append(f"{name}: {statuses[name]}")
+        return lines
+
+    def _source_warning_lines(self) -> list[str]:
+        warnings: list[str] = []
+        statuses: dict[str, str] = {}
+        if hasattr(self.source, "source_status"):
+            statuses.update(self.source.source_status)
+        if hasattr(self.market_source, "source_status"):
+            statuses.update(self.market_source.source_status)
+        for name, status in statuses.items():
+            if status not in {"ok", "not_used"}:
+                warnings.append(f"Teilquelle ausgefallen/verlangsamt: {name} = {status}.")
+        return warnings
+
+    def _format_failure_response(self, title: str, detail: str, status: str) -> str:
+        return "\n".join(
+            [
+                title,
+                detail,
+                *self._source_status_lines(),
+                f"Status: {status}",
+                "API langsam: moeglich, wenn Status timeout/rate_limit/temporary_http zeigt.",
+                "Teilquelle ausgefallen: moeglich, wenn eine Quelle nicht ok ist.",
+                "Scan komplett fehlgeschlagen: ja, wenn Status scan_failed/api_failed ist.",
+                "Scan erfolgreich, aber kein Signal: ja, wenn Status no_signal ist.",
+            ]
+        )
 
     def _parse_focus_term(self, text: str) -> tuple[str | None, str | None]:
         parts = text.split(maxsplit=1)
@@ -472,7 +560,7 @@ class WhaleSignalEngine:
         actionable = [signal for signal in signals if self._classify_signal(signal) == "actionable"]
         context = [signal for signal in signals if self._classify_signal(signal) == "context"]
         ignored = [signal for signal in signals if self._classify_signal(signal) == "ignore"]
-        lines = ["Scan fertig. Mehrere grosse Wallets gleichzeitig erkannt:", "Scan Summary:", f"Events scanned: {diagnostics.sampled_logs}", f"Zeitraum: {self._summary_window(signals)}", f"Gefundene Cluster: {len(signals)}", f"Top Opportunities: {len(actionable)}", f"Context Signals: {len(context)}", f"Ignored Signals: {len(ignored)}", "Filter-Modus: strict", "Top Altcoin Opportunities:"]
+        lines = ["Scan fertig. Mehrere grosse Wallets gleichzeitig erkannt:", "Scan Summary:", f"Events scanned: {diagnostics.sampled_logs}", f"Zeitraum: {self._summary_window(signals)}", f"Gefundene Cluster: {len(signals)}", f"Top Opportunities: {len(actionable)}", f"Context Signals: {len(context)}", f"Ignored Signals: {len(ignored)}", "Filter-Modus: strict", *self._source_status_lines(), "Top Altcoin Opportunities:"]
         if actionable:
             for index, signal in enumerate(actionable[:MAX_RESULTS], start=1):
                 lines.extend(self._format_signal_line(index, signal, "actionable"))
@@ -497,6 +585,8 @@ class WhaleSignalEngine:
                 lines.append(f"Kein direktes Signal fuer {diagnostics.focus_term.upper()} im aktuellen Sample gefunden.")
         else:
             lines.append("Signal-first Modus: Tokens werden erst aus den Events entdeckt, nicht vorgegeben.")
+        for warning in self._source_warning_lines():
+            lines.append(f"Warnung: {warning}")
         for limitation in diagnostics.source_limitations:
             lines.append(f"Limit: {limitation}")
         lines.append(f"Real: ERC-20 Transfer-Logs aus {diagnostics.sampled_logs} Events auf Ethereum.")
