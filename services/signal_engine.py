@@ -17,6 +17,7 @@ from config.settings import (
     WATCHLIST_SYMBOLS,
 )
 from models.domain_models import MarketContext, ScanDiagnostics, TokenMetadata, TokenTransferEvent, WhaleSignal
+from services.rotation_engine import RotationEngine
 from sources.coingecko_source import CoinGeckoSource
 from sources.etherscan_source import EtherscanSource
 from utils.decode_utils import decode_uint256
@@ -28,9 +29,13 @@ class WhaleSignalEngine:
     def __init__(self, source: EtherscanSource, market_source: CoinGeckoSource | None = None) -> None:
         self.source = source
         self.market_source = market_source or CoinGeckoSource()
+        self.rotation_engine = RotationEngine(self.market_source)
 
     def scan(self, user_text: str) -> str:
-        if user_text.strip().lower() in {"scan gainers", "scan movers", "scan market", "market", "gainers"}:
+        normalized_text = user_text.strip().lower()
+        if normalized_text == "scan rotation" or normalized_text.startswith("scan rotation "):
+            return self.rotation_engine.scan(user_text)
+        if normalized_text in {"scan gainers", "scan movers", "scan market", "market", "gainers"}:
             return self.scan_market_movers()
 
         if hasattr(self.source, "reset_status"):
