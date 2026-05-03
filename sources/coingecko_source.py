@@ -4,7 +4,7 @@ from utils.http_client import ExternalAPIError, get_json_with_retry
 
 
 class CoinGeckoSource:
-    """Public market-data source. Used for enrichment and separate market mover mode."""
+    """Public market-data source. Used for enrichment, market movers and rotation mode."""
 
     DEXSCREENER_BASE_URL = "https://api.dexscreener.com"
 
@@ -82,17 +82,8 @@ class CoinGeckoSource:
         self._cache[contract_address] = context
         return context
 
-    def get_market_movers(self, limit: int = 8) -> list[dict]:
-        """
-        Separate price/volume mover scan.
-        First tries CoinGecko. If CoinGecko is unavailable/rate-limited, falls back to DexScreener boosted tokens.
-        """
-        movers = self._get_coingecko_market_movers(limit=limit)
-        if movers:
-            return movers
-        return self._get_dexscreener_boosted_movers(limit=limit)
-
-    def _get_coingecko_market_movers(self, limit: int = 8) -> list[dict]:
+    def get_market_page(self, page: int = 1, per_page: int = 100) -> list[dict]:
+        """Top market coins with 24h/7d performance for rotation mode."""
         try:
             payload = get_json_with_retry(
                 f"{COINGECKO_BASE_URL}/coins/markets",
@@ -100,13 +91,13 @@ class CoinGeckoSource:
                 headers=self._build_headers(),
                 params={
                     "vs_currency": "usd",
-                    "order": "volume_desc",
-                    "per_page": 100,
-                    "page": 1,
+                    "order": "market_cap_desc",
+                    "per_page": per_page,
+                    "page": page,
                     "sparkline": "false",
-                    "price_change_percentage": "1h,24h,7d",
+                    "price_change_percentage": "24h,7d",
                 },
-                timeout=12,
+                timeout=14,
                 retries=2,
             )
             self._mark_ok("CoinGecko")
@@ -118,32 +109,48 @@ class CoinGeckoSource:
             self.source_status["CoinGecko"] = "invalid_payload"
             return []
 
-        cleaned: list[dict] = []
+        rows: list[dict] = []
         for coin in payload:
             if not isinstance(coin, dict):
                 continue
             symbol = str(coin.get("symbol", "")).upper()
             if not symbol:
                 continue
-            change_24h = self._safe_number(coin.get("price_change_percentage_24h"))
-            volume = self._safe_number(coin.get("total_volume"))
-            price = self._safe_number(coin.get("current_price"))
-            rank = coin.get("market_cap_rank")
+            rows.append(
+                {
+                    "name": coin.get("name") or symbol,
+                    "symbol": symbol,
+                    "price": self._safe_number(coin.get("current_price")),
+                    "change_24h": self._safe_number(coin.get("price_change_percentage_24h")),
+                    "change_7d": self._safe_number(coin.get("price_change_percentage_7d_in_currency")),
+                    "volume_24h": self._safe_number(coin.get("total_volume")),
+                    "market_cap": self._safe_number(coin.get("market_cap")),
+                    "rank": coin.get("market_cap_rank") if isinstance(coin.get("market_cap_rank"), int) else None,
+                    "source": "CoinGecko",
+                }
+            )
+        return rows
+
+    def get_market_movers(self, limit: int = 8) -> list[dict]:
+        movers = self._get_coingecko_market_movers(limit=limit)
+        if movers:
+            return movers
+        return self._get_dexscreener_boosted_movers(limit=limit)
+
+    def _get_coingecko_market_movers(self, limit: int = 8) -> list[dict]:
+        rows = self.get_market_page(page=1, per_page=100)
+        cleaned: list[dict] = []
+        for coin in rows:
+            change_24h = self._safe_number(coin.get("change_24h"))
             if change_24h is None:
                 continue
             cleaned.append(
                 {
-                    "name": coin.get("name") or symbol,
-                    "symbol": symbol,
-                    "price": price,
-                    "change_24h": change_24h,
-                    "volume_24h": volume,
-                    "rank": rank if isinstance(rank, int) else None,
-                    "market_cap": self._safe_number(coin.get("market_cap")),
+                    **coin,
                     "source": "CoinGecko",
                     "note": "price-volume mover",
                     "chain": "multi",
-                    "token_address": str(coin.get("id", symbol)).lower(),
+                    "token_address": str(coin.get("symbol", "")).lower(),
                 }
             )
 
@@ -151,10 +158,6 @@ class CoinGeckoSource:
         return self._dedupe_movers(cleaned)[:limit]
 
     def _get_dexscreener_boosted_movers(self, limit: int = 8) -> list[dict]:
-        """
-        DexScreener fallback: not pure gainers, but actively boosted/trending tokens with pair data.
-        Useful when CoinGecko returns nothing.
-        """
         try:
             boosted_payload = get_json_with_retry(
                 f"{self.DEXSCREENER_BASE_URL}/token-boosts/top/v1",
@@ -226,6 +229,7 @@ class CoinGeckoSource:
             "symbol": symbol,
             "price": self._safe_float_string(pair.get("priceUsd")),
             "change_24h": self._safe_number(price_change.get("h24")),
+            "change_7d": None,
             "volume_24h": self._safe_number(volume.get("h24")),
             "rank": None,
             "market_cap": self._safe_number(pair.get("marketCap")) or self._safe_number(pair.get("fdv")),
