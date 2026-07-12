@@ -9,6 +9,9 @@ DECIMALS_METHOD = "0x313ce567"
 SYMBOL_METHOD = "0x95d89b41"
 NAME_METHOD = "0x06fdde03"
 
+SIGNAL_ENGINE_VERSION = "2.0.0"
+OPENCLAW_SCHEMA_VERSION = "whalebot.openclaw.v1"
+
 SCAN_LOOKBACK_BLOCKS = 900
 SCAN_WINDOW_SECONDS = 3 * 60 * 60
 MARKET_LOG_PAGES = 2
@@ -19,6 +22,19 @@ MAX_METADATA_TOKENS = 35
 LARGE_EVENT_PERCENTILE = 0.8
 MAX_RESULTS = 3
 COINGECKO_ENRICH_LIMIT = 18
+
+# Signal-quality v2: raw token units are not comparable between tokens.
+# Actionability therefore depends on market-backed USD notional, direction quality,
+# independent counterparties and a discovery score that excludes portfolio bias.
+MIN_ESTIMATED_NOTIONAL_USD = 50_000.0
+MIN_CONFIRMED_SCORE = 24.0
+MAX_COUNTERPARTY_CONCENTRATION = 0.60
+MAX_HUB_COUNTERPARTIES = 2
+
+# Shared market-context cache. Successes stay fresh for a few minutes;
+# negative/error results expire quickly so a temporary API problem cannot poison a process.
+MARKET_CONTEXT_CACHE_TTL_SECONDS = 180
+MARKET_CONTEXT_NEGATIVE_CACHE_TTL_SECONDS = 30
 
 STABLECOIN_SYMBOLS = {
     "USDT",
@@ -51,8 +67,9 @@ BLACKLIST_SYMBOLS = {
     "HEX",
 }
 
-# Optional priority terms. The scanner remains broad/signal-first, but these
-# symbols get a small score bump if they are detected naturally in the sample.
+# Portfolio relevance is kept separate from market discovery quality.
+# These symbols may receive a transparent ranking bonus, but the bonus cannot
+# establish token identity or promote a weak signal to actionable by itself.
 WATCHLIST_SYMBOLS = {
     "ONDO",
     "LINK",
