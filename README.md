@@ -1,66 +1,99 @@
-# portfolio
+# Whale Signal Bot
 
-Modulare Whale-Signal-Plattform auf FastAPI-Basis.
+Modulare Whale-Signal-Plattform auf FastAPI-Basis. Der Bot ist ein eigenstaendiger
+Dienst; OpenClaw kann ihn ueber die maschinenlesbaren Endpunkte verwenden.
 
 ## Struktur
 
-- `app.py`
-  FastAPI-Entrypoint und Middleware.
-- `routes/`
-  API-Endpunkte und HTTP-Wiring.
-- `services/`
-  Business-Logik fuer Wallet-Checks, Scan-Flow und Signal-Engine.
-- `sources/`
-  Externe Datenquellen wie Etherscan und CoinGecko.
-- `models/`
-  Typisierte API- und Domain-Objekte.
-- `utils/`
-  Kleine Hilfsfunktionen fuer Text, Zeitfenster und ABI-Decoding.
-- `config/`
-  Zentrale Settings, Konstanten und Limits.
+- `app.py` – FastAPI-Entrypoint und Middleware
+- `routes/` – API-Endpunkte und HTTP-Wiring
+- `services/` – Wallet-, Scan-, Rotation-, Qualitaets- und OpenClaw-Logik
+- `sources/` – Etherscan, CoinGecko und DexScreener
+- `models/` – typisierte API- und Domain-Objekte
+- `utils/` – HTTP, Text, Zeitfenster und ABI-Decoding
+- `config/` – zentrale Settings, Schwellen und Versionen
 
-## Was aktuell funktioniert
+## Befehle
 
-- normale Textnachrichten einfach beantworten
-- Ethereum-Wallet-Adressen erkennen
-- ETH-Guthaben ueber Etherscan abfragen
-- die letzten Transaktionen kompakt anzeigen
-- mit `scan` breit nach Whale-Clustern in aktuellen Ethereum ERC-20 Transfers suchen
-- Tokens erst aus den Events entdecken und dann nach Richtung und Zeitfenster gruppieren
-- `scan ondo` oder `scan pepe` als Priorisierung ueber dem breiten Scan verstehen
-- Stablecoins im Ranking eher nach hinten schieben
-- Wallet-Qualitaet, Wiederholungen und Token-Relevanz in ein einfaches Ranking einbauen
-- CoinGecko Markt-Kontext fuer Preis, Volume, Market-Cap-Rank und Narrative als Enrichment nutzen
-- nur die Top 3 Signale ausgeben
-- Signale mit starker accumulation und distribution im selben Zeitfenster komplett verwerfen
-- nur Cluster mit mindestens 5 grossen Wallets pro Richtung behalten
+- `scan` – breiter Ethereum ERC-20 Whale-Cluster-Scan
+- `scan <coin>` – fokussierter Whale-Scan ohne feste Startliste
+- `scan gainers` – Preis-/Volumen-Mover
+- `scan rotation` – Relative Staerke gegen BTC, ETH und Altmarkt
+- `scan rotation <coin>` – fokussierte Rotation
+- `0x...` – Ethereum-Wallet-Check
 
-## Was bereits echt ist
+## OpenClaw API
 
-- Etherscan Block-, Log- und Proxy-Abfragen
-- echte ERC-20 Transfer-Events auf Ethereum
-- dynamische Token-Erkennung aus aktuellen Transfer-Logs
-- Cluster-Erkennung ueber mehrere grosse Wallets im gleichen Zeitfenster
-- signal-first Scan-Logik statt fester Coin-Startliste
-- CoinGecko Markt-Kontext pro erkanntem Token mit Cache im eigenen Source-Modul
-- Top-3-Ranking mit Transfer-Staerke plus Markt-Kontext-Enrichment
+- `GET /health`
+- `GET /capabilities`
+- `POST /openclaw/scan`
 
-## Was noch Platzhalter oder nur Proxy-Logik ist
+Beispiel:
 
-- accumulation/distribution basiert aktuell auf grossen Token-Transfers, nicht auf bestaetigten DEX-Buys oder DEX-Sells
-- der breite Markt-Scan ist wegen Etherscan-Result-Limits nur eine aktuelle Stichprobe, nicht Vollabdeckung
-- SUI und PLUME brauchen noch eigene Chain- oder Explorer-APIs
-- fuer echtes Buy/Sell, Liquiditaet und Preis-Kontext braucht der Bot zusaetzlich DEX-/Marktdatenquellen
-- CoinGecko Mapping kann fuer einzelne Contracts fehlen; dann bleibt das Signal bestehen, aber ohne Markt-Kontext
+```json
+{
+  "mode": "confluence",
+  "focus": "ondo"
+}
+```
 
-## Wichtige Environment Variable
+Unterstuetzte Modi:
+
+- `whale`
+- `market`
+- `rotation`
+- `confluence`
+- `wallet`
+
+Die Antwort enthaelt Schema-/Engine-Version, Source-Status, Cache-Diagnostik,
+strukturierte Scan-Daten und den kompatiblen Textoutput.
+
+## Signal Quality v2
+
+Die v2-Engine beseitigt mehrere systematische Fehlerquellen:
+
+- Markt-Kontext hat TTL statt Prozess-Lebenszeit-Cache
+- temporaere 404/API-Fehler werden nur kurz negativ gecacht
+- Source-Status ist request-lokal und nicht zwischen parallelen Scans vermischt
+- rohe Token-Mengen beeinflussen den Score nicht mehr chainuebergreifend
+- USD-Notional, Liquiditaet, Richtungsschaerfe und Wallet-Qualitaet werden bewertet
+- dominante Einzel-Gegenparteien werden als Router/Bridge/Exchange/Airdrop-Risiko markiert
+- Portfolio-Bonus wird separat ausgewiesen und beweist weder Identitaet noch Actionability
+- `actionable` verlangt harte Qualitaetsmerkmale; schwache Signale bleiben Context
+- OpenClaw erhaelt strukturierte Snapshots statt nur frei formatiertem Text
+
+## Was real ist
+
+- Etherscan Block-, Log-, Proxy- und Wallet-Abfragen
+- echte Ethereum ERC-20 Transfer-Events
+- dynamische Token-Erkennung aus aktuellen Logs
+- Cluster-Erkennung ueber mehrere Wallets im gleichen Zeitfenster
+- CoinGecko Markt-Kontext und Relative-Strength-Daten
+- DexScreener-Fallback fuer Market Movers
+
+## Grenzen
+
+- Accumulation/Distribution ist transferbasiert, nicht DEX-buy/sell-bestaetigt
+- Etherscan liefert eine aktuelle Stichprobe, keine Vollabdeckung
+- Entity Labels fuer Exchanges, Router, Bridges und Treasury-Wallets fehlen noch
+- SUI und PLUME brauchen eigene Chain-/Explorer-Quellen
+
+## Environment
 
 - `ETHERSCAN_API_KEY`
+- optional `COINGECKO_API_KEY` oder `COINGECKO_DEMO_API_KEY`
 
-## TODO naechste Upgrades
+## Tests
 
-- DEX buy/sell detection
-- smart money wallet scoring
-- multi-chain support
-- alerting
-- Telegram integration
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+pytest -q
+```
+
+## Naechste sinnvolle Upgrades
+
+- DEX swap/buy/sell confirmation
+- Exchange/Bridge/Router entity registry
+- Smart-money wallet scoring
+- Multi-chain source adapters
+- alerting / Telegram
