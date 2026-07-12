@@ -57,6 +57,16 @@ class WhaleSignal:
     is_stablecoin: bool = False
     market_context: MarketContext | None = None
 
+    # Signal-quality v2 fields. Defaults preserve compatibility with the original engine.
+    estimated_notional_usd: float | None = None
+    discovery_score: float = 0.0
+    portfolio_bonus: float = 0.0
+    counterparty_concentration: float = 0.0
+    counterparty_count: int = 0
+    quality_tier: str = "observed"
+    score_breakdown: dict[str, float] = field(default_factory=dict)
+    quality_flags: list[str] = field(default_factory=list)
+
 
 @dataclass
 class ScanDiagnostics:
