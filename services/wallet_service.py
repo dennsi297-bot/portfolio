@@ -1,6 +1,5 @@
-import requests
-
 from sources.etherscan_source import EtherscanSource
+from utils.http_client import ExternalAPIError
 
 
 class WalletService:
@@ -12,15 +11,15 @@ class WalletService:
     def format_wallet_summary(self, wallet_address: str) -> str:
         try:
             balance_text = self.source.get_eth_balance(wallet_address)
-        except requests.RequestException:
-            return "Fehler: Etherscan konnte gerade nicht erreicht werden."
+        except ExternalAPIError as exc:
+            return f"Fehler: Etherscan konnte gerade nicht erreicht werden ({exc.kind})."
 
         if balance_text.startswith("Fehler:"):
             return balance_text
 
         try:
             recent_transactions = self.source.get_wallet_transactions(wallet_address, limit=3)
-        except requests.RequestException:
+        except ExternalAPIError:
             recent_transactions = []
 
         if not recent_transactions:
@@ -38,7 +37,10 @@ class WalletService:
 
         for tx in recent_transactions:
             direction = self._format_tx_direction(wallet_address, tx)
-            value_eth = int(tx.get("value", "0")) / 10**18
+            try:
+                value_eth = int(tx.get("value", "0")) / 10**18
+            except (TypeError, ValueError):
+                value_eth = 0.0
             tx_hash = str(tx.get("hash", ""))[:10]
             lines.append(f"- {direction}: {value_eth:.6f} ETH | Hash {tx_hash}...")
 
