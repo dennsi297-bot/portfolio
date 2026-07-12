@@ -26,7 +26,7 @@ class OpenClawService:
                 "market": "Price/volume movers from CoinGecko with DexScreener fallback.",
                 "rotation": "Relative strength versus BTC, ETH and broad alt-market proxy.",
                 "confluence": "Focused whale scan plus focused rotation scan in one response.",
-                "wallet": "Ethereum wallet balance and recent transactions.",
+                "wallet": "Structured Ethereum wallet balance and recent transactions.",
             },
             "commands": [
                 "scan",
@@ -81,36 +81,39 @@ class OpenClawService:
         signal_engine = WhaleSignalEngineV2(etherscan, market)
         message_service = MessageService(wallet_service, signal_engine)
 
+        data: dict = {}
         if mode == "wallet":
             target = (wallet or focus or "").strip()
             if not is_ethereum_wallet(target):
                 raise ValueError("wallet mode requires a valid Ethereum 0x address.")
             command = target
-        elif mode == "market":
-            command = "scan gainers"
-        elif mode == "rotation":
-            command = f"scan rotation {focus}" if focus else "scan rotation"
+            data = wallet_service.get_wallet_snapshot(target)
+            response_text = wallet_service.format_wallet_snapshot(data)
         else:
-            command = f"scan {focus}" if focus else "scan"
+            if mode == "market":
+                command = "scan gainers"
+            elif mode == "rotation":
+                command = f"scan rotation {focus}" if focus else "scan rotation"
+            else:
+                command = f"scan {focus}" if focus else "scan"
 
-        response_text = message_service.handle_message(command)
+            response_text = message_service.handle_message(command)
+            if mode == "whale":
+                data = signal_engine.last_scan_snapshot
+            elif mode == "rotation":
+                data = signal_engine.rotation_engine.last_snapshot
+            elif mode == "market":
+                data = signal_engine.last_market_snapshot
+
         source_status = {}
         source_status.update(getattr(etherscan, "source_status", {}))
         source_status.update(getattr(market, "source_status", {}))
-
-        data: dict = {}
-        if mode == "whale":
-            data = signal_engine.last_scan_snapshot
-        elif mode == "rotation":
-            data = signal_engine.rotation_engine.last_snapshot
-        elif mode == "market":
-            data = signal_engine.last_market_snapshot
 
         return {
             "schema_version": OPENCLAW_SCHEMA_VERSION,
             "engine_version": SIGNAL_ENGINE_VERSION,
             "generated_at": self._now(),
-            "ok": self._response_ok(response_text),
+            "ok": self._result_ok(data, response_text),
             "mode": mode,
             "focus": focus,
             "command": command,
@@ -119,6 +122,14 @@ class OpenClawService:
             "data": data,
             "response_text": response_text,
         }
+
+    @staticmethod
+    def _result_ok(data: dict, response_text: str) -> bool:
+        """Prefer authoritative structured status; use text only for legacy failures."""
+        structured_ok = data.get("ok") if isinstance(data, dict) else None
+        if isinstance(structured_ok, bool):
+            return structured_ok
+        return OpenClawService._response_ok(response_text)
 
     @staticmethod
     def _build_confluence(focus: str, whale: dict, rotation: dict) -> dict:
