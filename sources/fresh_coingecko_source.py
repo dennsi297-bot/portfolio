@@ -43,7 +43,7 @@ class FreshCoinGeckoSource(CoinGeckoSource):
                 expires_at, context = cached
                 if expires_at > now:
                     self.cache_hits += 1
-                    self.source_status["CoinGecko"] = "ok"
+                    self.source_status["CoinGecko"] = "ok" if context.available else "cached_unavailable"
                     return context
                 self._shared_cache.pop(key, None)
 
@@ -58,7 +58,7 @@ class FreshCoinGeckoSource(CoinGeckoSource):
         )
 
         with self._cache_lock:
-            self._shared_cache[key] = (now + ttl, context)
+            self._shared_cache[key] = (time.monotonic() + ttl, context)
         return context
 
     def get_market_movers(self, limit: int = 8) -> list[dict]:
