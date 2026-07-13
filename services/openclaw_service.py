@@ -58,13 +58,18 @@ class OpenClawService:
             whale = self._run_single("whale", normalized_focus, None)
             rotation = self._run_single("rotation", normalized_focus, None)
             confluence = self._build_confluence(normalized_focus, whale, rotation)
+            source_status = self._merge_source_status(whale, rotation)
+            source_errors = self._merge_source_errors(whale, rotation)
             return {
                 "schema_version": OPENCLAW_SCHEMA_VERSION,
                 "engine_version": SIGNAL_ENGINE_VERSION,
                 "generated_at": self._now(),
                 "ok": whale["ok"] and rotation["ok"],
+                "degraded": bool(whale.get("degraded") or rotation.get("degraded")),
                 "mode": "confluence",
                 "focus": normalized_focus,
+                "source_status": source_status,
+                "source_errors": source_errors,
                 "confluence": confluence,
                 "legs": {
                     "whale": whale,
@@ -108,20 +113,61 @@ class OpenClawService:
         source_status = {}
         source_status.update(getattr(etherscan, "source_status", {}))
         source_status.update(getattr(market, "source_status", {}))
+        source_errors = self._collect_source_errors(etherscan, market)
+        degraded = self._is_degraded(source_status)
 
         return {
             "schema_version": OPENCLAW_SCHEMA_VERSION,
             "engine_version": SIGNAL_ENGINE_VERSION,
             "generated_at": self._now(),
             "ok": self._result_ok(data, response_text),
+            "degraded": degraded,
             "mode": mode,
             "focus": focus,
             "command": command,
             "source_status": source_status,
+            "source_errors": source_errors,
             "cache": market.cache_diagnostics(),
             "data": data,
             "response_text": response_text,
         }
+
+    @staticmethod
+    def _collect_source_errors(etherscan: EtherscanSource, market: FreshCoinGeckoSource) -> list[str]:
+        errors: list[str] = []
+        etherscan_error = getattr(etherscan, "last_error", None)
+        if etherscan_error:
+            errors.append(str(etherscan_error))
+        for error in getattr(market, "last_errors", []):
+            text = str(error)
+            if text and text not in errors:
+                errors.append(text)
+        return errors
+
+    @staticmethod
+    def _is_degraded(source_status: dict[str, str]) -> bool:
+        acceptable = {"ok", "ok_cached", "not_used", "cached_unavailable"}
+        return any(status not in acceptable for status in source_status.values())
+
+    @staticmethod
+    def _merge_source_status(*results: dict) -> dict[str, str]:
+        merged: dict[str, str] = {}
+        for result in results:
+            for source, status in (result.get("source_status") or {}).items():
+                existing = merged.get(source)
+                if existing is None or existing in {"ok", "ok_cached", "not_used"}:
+                    merged[source] = status
+        return merged
+
+    @staticmethod
+    def _merge_source_errors(*results: dict) -> list[str]:
+        merged: list[str] = []
+        for result in results:
+            for error in result.get("source_errors") or []:
+                text = str(error)
+                if text and text not in merged:
+                    merged.append(text)
+        return merged
 
     @staticmethod
     def _result_ok(data: dict, response_text: str) -> bool:
