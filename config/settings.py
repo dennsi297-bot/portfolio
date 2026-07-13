@@ -31,10 +31,16 @@ MIN_CONFIRMED_SCORE = 24.0
 MAX_COUNTERPARTY_CONCENTRATION = 0.60
 MAX_HUB_COUNTERPARTIES = 2
 
-# Shared market-context cache. Successes stay fresh for a few minutes;
+# Shared contract-context cache. Successes stay fresh for a few minutes;
 # negative/error results expire quickly so a temporary API problem cannot poison a process.
 MARKET_CONTEXT_CACHE_TTL_SECONDS = 180
 MARKET_CONTEXT_NEGATIVE_CACHE_TTL_SECONDS = 30
+
+# Broad market pages are reused across market, rotation and confluence calls.
+# When CoinGecko rate-limits a later request, a recent stale page can keep research
+# operational while the response is explicitly marked degraded.
+MARKET_PAGE_CACHE_TTL_SECONDS = 180
+MARKET_PAGE_STALE_TTL_SECONDS = 15 * 60
 
 STABLECOIN_SYMBOLS = {
     "USDT",
