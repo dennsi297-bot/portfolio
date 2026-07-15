@@ -17,7 +17,8 @@ class MessageService:
         if is_ethereum_wallet(original_text):
             return self.wallet_service.format_wallet_summary(original_text)
         if lowered_text.startswith("scan"):
-            return self.signal_engine.scan(lowered_text)
+            response = self.signal_engine.scan(lowered_text)
+            return self._append_freshness_warning(response)
         if "hallo" in lowered_text:
             return "Hey"
         if "hilfe" in lowered_text:
@@ -28,3 +29,21 @@ class MessageService:
         if "preis" in lowered_text:
             return "Kommt drauf an"
         return "Noch nicht gelernt"
+
+    def _append_freshness_warning(self, response: str) -> str:
+        market_source = getattr(self.signal_engine, "market_source", None)
+        statuses = getattr(market_source, "source_status", {})
+        stale = any(
+            str(status).startswith("stale_cache_")
+            or str(status).startswith("circuit_open_")
+            for status in statuses.values()
+        )
+        if not stale:
+            return response
+        return "\n".join(
+            [
+                response,
+                "QUALITY GUARD: Markt-Kontext ist stale/degraded.",
+                "Diese Daten duerfen keinen neuen Trend, kein actionable Signal und keine starke Confluence bestaetigen.",
+            ]
+        )
