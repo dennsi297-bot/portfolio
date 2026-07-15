@@ -93,9 +93,10 @@ class FreshCoinGeckoSource(CoinGeckoSource):
         stale_rows: list[dict] | None = None
         allow_fresh_reuse = self.cache_policy == "same_run_reuse"
         allow_stale = self.cache_policy != "audit_refresh"
+        cls = type(self)
 
-        with self._cache_lock:
-            cached = self._shared_page_cache.get(key)
+        with cls._cache_lock:
+            cached = cls._shared_page_cache.get(key)
             if cached is not None:
                 fresh_until, stale_until, rows = cached
                 if allow_fresh_reuse and fresh_until > now:
@@ -105,10 +106,10 @@ class FreshCoinGeckoSource(CoinGeckoSource):
                 if allow_stale and stale_until > now:
                     stale_rows = rows
                 elif stale_until <= now:
-                    self._shared_page_cache.pop(key, None)
+                    cls._shared_page_cache.pop(key, None)
 
-            circuit_open = self._circuit_until > now
-            circuit_reason = self._circuit_reason
+            circuit_open = cls._circuit_until > now
+            circuit_reason = cls._circuit_reason
 
         if circuit_open:
             self.circuit_breaker_hits += 1
@@ -124,21 +125,21 @@ class FreshCoinGeckoSource(CoinGeckoSource):
         if rows:
             stored_rows = copy.deepcopy(rows)
             stored_at = time.monotonic()
-            with self._cache_lock:
-                self._shared_page_cache[key] = (
+            with cls._cache_lock:
+                cls._shared_page_cache[key] = (
                     stored_at + MARKET_PAGE_CACHE_TTL_SECONDS,
                     stored_at + MARKET_PAGE_STALE_TTL_SECONDS,
                     stored_rows,
                 )
-                self._circuit_until = 0.0
-                self._circuit_reason = ""
+                cls._circuit_until = 0.0
+                cls._circuit_reason = ""
             return rows
 
         failure_kind = self.source_status.get("CoinGecko", "unavailable")
         if failure_kind in {"rate_limit", "temporary_http", "timeout", "connection"}:
-            with self._cache_lock:
-                self._circuit_until = time.monotonic() + COINGECKO_CIRCUIT_BREAKER_SECONDS
-                self._circuit_reason = failure_kind
+            with cls._cache_lock:
+                cls._circuit_until = time.monotonic() + COINGECKO_CIRCUIT_BREAKER_SECONDS
+                cls._circuit_reason = failure_kind
 
         if stale_rows is not None:
             self.page_stale_fallbacks += 1
@@ -153,8 +154,9 @@ class FreshCoinGeckoSource(CoinGeckoSource):
 
     def cache_diagnostics(self) -> dict[str, int | str | bool | float]:
         now = time.monotonic()
-        with self._cache_lock:
-            circuit_remaining = max(0.0, self._circuit_until - now)
+        cls = type(self)
+        with cls._cache_lock:
+            circuit_remaining = max(0.0, cls._circuit_until - now)
         return {
             "cache_policy": self.cache_policy,
             "contract_hits": self.cache_hits,
