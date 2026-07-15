@@ -40,14 +40,19 @@ class MarketUniverseService:
         benchmark_rows = self.market_source.get_market_page(page=1, per_page=100)
         btc = self._find_symbol(benchmark_rows, "BTC")
         eth = self._find_symbol(benchmark_rows, "ETH")
+        rows_by_page: dict[int, list[dict]] = {1: benchmark_rows} if benchmark_rows else {}
         rows: list[dict] = []
         completed_pages: list[int] = []
 
         for requested_page in requested_pages:
-            page_rows = self.market_source.get_market_page(
-                page=requested_page,
-                per_page=100,
-            )
+            page_rows = rows_by_page.get(requested_page)
+            if page_rows is None:
+                page_rows = self.market_source.get_market_page(
+                    page=requested_page,
+                    per_page=100,
+                )
+                if page_rows:
+                    rows_by_page[requested_page] = page_rows
             if not page_rows:
                 break
             rows.extend(page_rows)
@@ -58,6 +63,7 @@ class MarketUniverseService:
                 "ok": False,
                 "mode": "universe",
                 "reason": "no_market_data",
+                "decision_eligible": False,
                 "coverage": {
                     "start_page": start_page,
                     "end_page": start_page,
@@ -70,7 +76,9 @@ class MarketUniverseService:
             }
 
         last_page = completed_pages[-1]
-        self.ledger.set_checkpoint(self.CURSOR_KEY, last_page)
+        complete = len(completed_pages) == len(requested_pages)
+        if complete:
+            self.ledger.set_checkpoint(self.CURSOR_KEY, last_page)
 
         candidates = [
             self._candidate(row, btc, eth)
@@ -80,8 +88,9 @@ class MarketUniverseService:
         candidates.sort(key=lambda row: row["score"], reverse=True)
         weak = sorted(candidates, key=lambda row: row["score"])[:10]
         result = {
-            "ok": len(completed_pages) == len(requested_pages),
+            "ok": complete,
             "mode": "universe",
+            "decision_eligible": complete,
             "coverage": {
                 "start_page": start_page,
                 "end_page": last_page,
