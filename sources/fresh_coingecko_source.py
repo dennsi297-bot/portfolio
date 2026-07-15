@@ -68,7 +68,7 @@ class FreshCoinGeckoSource(CoinGeckoSource):
                         self.source_status["CoinGecko"] = (
                             "ok_cached" if context.available else "cached_unavailable"
                         )
-                        return copy.deepcopy(context)
+                        return context
                     self._shared_cache.pop(key, None)
 
         self.cache_misses += 1
@@ -83,7 +83,7 @@ class FreshCoinGeckoSource(CoinGeckoSource):
         with self._cache_lock:
             self._shared_cache[key] = (
                 time.monotonic() + ttl,
-                copy.deepcopy(context),
+                context,
             )
         return context
 
