@@ -2,7 +2,13 @@ import uuid
 
 from fastapi import APIRouter, HTTPException, status
 
-from config.settings import DEFAULT_CACHE_POLICY, OPENCLAW_SCHEMA_VERSION, SIGNAL_ENGINE_VERSION
+from config.settings import (
+    DEFAULT_CACHE_POLICY,
+    MARKET_UNIVERSE_DEFAULT_MAX_PAGES,
+    MARKET_UNIVERSE_DEFAULT_PAGES_PER_RUN,
+    OPENCLAW_SCHEMA_VERSION,
+    SIGNAL_ENGINE_VERSION,
+)
 from models.api_models import MessageRequest, OpenClawScanRequest
 from services.evidence_ledger import get_evidence_ledger
 from services.message_service import MessageService
@@ -37,6 +43,17 @@ def _request_payload(request: OpenClawScanRequest) -> dict:
     return request.dict()
 
 
+def _uses_advanced_options(request: OpenClawScanRequest) -> bool:
+    return any(
+        [
+            request.cache_policy != DEFAULT_CACHE_POLICY,
+            request.verification_passes != 1,
+            request.market_pages_per_run != MARKET_UNIVERSE_DEFAULT_PAGES_PER_RUN,
+            request.market_max_pages != MARKET_UNIVERSE_DEFAULT_MAX_PAGES,
+        ]
+    )
+
+
 @router.get("/")
 def read_root():
     return {
@@ -55,7 +72,14 @@ def handle_message(message: MessageRequest):
 @router.post("/openclaw/scan")
 def openclaw_scan(request: OpenClawScanRequest):
     try:
-        return OpenClawService().execute(
+        service = OpenClawService()
+        if not _uses_advanced_options(request):
+            return service.execute(
+                mode=request.mode,
+                focus=request.focus,
+                wallet=request.wallet,
+            )
+        return service.execute(
             mode=request.mode,
             focus=request.focus,
             wallet=request.wallet,
