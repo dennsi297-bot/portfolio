@@ -33,23 +33,6 @@ def read_root():
     }
 
 
-@router.get("/health")
-def health():
-    etherscan_source = EtherscanSource()
-    return {
-        "ok": True,
-        "service": "whale-signal-bot",
-        "engine_version": SIGNAL_ENGINE_VERSION,
-        "openclaw_schema": OPENCLAW_SCHEMA_VERSION,
-        "etherscan_configured": etherscan_source.has_api_key(),
-    }
-
-
-@router.get("/capabilities")
-def capabilities():
-    return OpenClawService.capabilities()
-
-
 @router.post("/message")
 def handle_message(message: MessageRequest):
     service = _build_message_service()
