@@ -89,8 +89,7 @@ CAPABILITY_MANIFEST: dict[str, Any] = {
         "Whale direction is transfer-based and not yet a DEX-confirmed buy/sell.",
         "Ethereum logs remain bounded by Etherscan result limits.",
         "Rolling universe coverage is broad over time, not one instant all-token snapshot.",
-        "SUI and PLUME need dedicated chain/explorer sources.",
-        "Portfolio bonus is reported separately and cannot establish actionability.",
+        "Portfolio bonus is separate and cannot establish actionability.",
     ],
     "safety": {
         "creates_order": False,
