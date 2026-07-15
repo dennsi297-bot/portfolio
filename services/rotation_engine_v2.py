@@ -22,6 +22,8 @@ class RotationEngineV2(RotationEngine):
                 "mode": "rotation",
                 "focus": focus,
                 "reason": "no_market_data",
+                "decision_eligible": False,
+                "freshness_eligible": False,
             }
             return "\n".join(
                 [
@@ -40,6 +42,8 @@ class RotationEngineV2(RotationEngine):
                 "mode": "rotation",
                 "focus": focus,
                 "reason": "benchmark_missing",
+                "decision_eligible": False,
+                "freshness_eligible": False,
             }
             return "\n".join(
                 [
@@ -66,11 +70,19 @@ class RotationEngineV2(RotationEngine):
         weak = sorted(candidates, key=lambda item: item["score"])[:5]
         btc_24h = self._safe_number(btc.get("change_24h"))
         eth_24h = self._safe_number(eth.get("change_24h"))
+        stale = self._market_is_stale()
+
+        for candidate in top:
+            candidate["freshness_eligible"] = not stale
+            candidate["decision_eligible"] = not stale
 
         self.last_snapshot = {
             "ok": True,
             "mode": "rotation",
             "focus": focus,
+            "freshness": "stale_or_circuit" if stale else "fresh_or_live",
+            "freshness_eligible": not stale,
+            "decision_eligible": not stale,
             "universe_size": len(coins),
             "market_regime": {
                 "btc_24h": btc_24h,
@@ -82,4 +94,29 @@ class RotationEngineV2(RotationEngine):
             "top_candidates": top,
             "weak_candidates": weak,
         }
-        return self._format_response(top, weak, btc, eth, alt_proxy_24h, alt_proxy_7d, focus)
+        response = self._format_response(
+            top,
+            weak,
+            btc,
+            eth,
+            alt_proxy_24h,
+            alt_proxy_7d,
+            focus,
+        )
+        if stale:
+            response = "\n".join(
+                [
+                    response,
+                    "QUALITY GUARD: Rotation basiert auf stale/degraded Marktdaten.",
+                    "Keine neue Trendbestaetigung und keine strong_confluence erlaubt.",
+                ]
+            )
+        return response
+
+    def _market_is_stale(self) -> bool:
+        statuses = getattr(self.market_source, "source_status", {})
+        return any(
+            str(status).startswith("stale_cache_")
+            or str(status).startswith("circuit_open_")
+            for status in statuses.values()
+        )
