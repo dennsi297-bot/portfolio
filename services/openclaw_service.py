@@ -103,34 +103,52 @@ class OpenClawService:
                 market_max_pages=market_max_pages,
             )
 
-        results = []
-        for pass_index in range(verification_passes):
-            pass_policy = cache_policy if pass_index == 0 else "audit_refresh"
-            pass_run_id = f"{base_run_id}-p{pass_index + 1}"
-            results.append(
-                self._execute_once(
-                    normalized_mode,
-                    normalized_focus,
-                    wallet,
-                    cache_policy=pass_policy,
-                    run_id=pass_run_id,
-                    verification_passes=verification_passes,
-                    market_pages_per_run=market_pages_per_run,
-                    market_max_pages=market_max_pages,
-                )
-            )
-
-        primary = copy.deepcopy(results[-1])
-        verification = self._verification_summary(normalized_mode, results)
-        primary["run_id"] = base_run_id
-        primary["verification"] = verification
-        primary["verification_passes"] = verification_passes
-        primary["decision_eligible"] = bool(
-            primary.get("decision_eligible")
-            and verification["status"] == "confirmed"
+        self.ledger.start_run(
+            base_run_id,
+            normalized_mode,
+            normalized_focus,
+            cache_policy,
+            verification_passes,
         )
-        primary["verification_results"] = results
-        return primary
+        try:
+            results = []
+            for pass_index in range(verification_passes):
+                pass_policy = cache_policy if pass_index == 0 else "audit_refresh"
+                pass_run_id = f"{base_run_id}-p{pass_index + 1}"
+                results.append(
+                    self._execute_once(
+                        normalized_mode,
+                        normalized_focus,
+                        wallet,
+                        cache_policy=pass_policy,
+                        run_id=pass_run_id,
+                        verification_passes=verification_passes,
+                        market_pages_per_run=market_pages_per_run,
+                        market_max_pages=market_max_pages,
+                    )
+                )
+
+            primary = copy.deepcopy(results[-1])
+            verification = self._verification_summary(normalized_mode, results)
+            primary["run_id"] = base_run_id
+            primary["child_run_ids"] = [result.get("run_id") for result in results]
+            primary["verification"] = verification
+            primary["verification_passes"] = verification_passes
+            primary["decision_eligible"] = bool(
+                primary.get("decision_eligible")
+                and verification["status"] == "confirmed"
+            )
+            primary["verification_results"] = results
+            status = (
+                "COMPLETED"
+                if primary.get("ok")
+                else "COMPLETED_WITH_SOURCE_ERROR"
+            )
+            self.ledger.finish_run(base_run_id, status, result=primary)
+            return primary
+        except Exception as exc:
+            self.ledger.finish_run(base_run_id, "FAILED", error=str(exc))
+            raise
 
     def _execute_once(
         self,
@@ -539,6 +557,11 @@ class OpenClawService:
             )
         if verification_passes < 1 or verification_passes > 3:
             raise ValueError("verification_passes must be between 1 and 3.")
+        if mode == "universe" and verification_passes > 1:
+            raise ValueError(
+                "universe mode advances rolling coverage and therefore supports one pass per request; "
+                "submit additional fresh jobs for independent market segments."
+            )
 
     @staticmethod
     def _response_ok(response_text: str) -> bool:
