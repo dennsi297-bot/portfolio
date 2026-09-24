@@ -63,6 +63,21 @@ class EvidenceLedger:
                     error TEXT
                 );
 
+                CREATE TABLE IF NOT EXISTS scan_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    submitted_at TEXT NOT NULL,
+                    started_at TEXT,
+                    finished_at TEXT,
+                    request_json TEXT NOT NULL,
+                    result_json TEXT,
+                    error TEXT,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_scan_jobs_status
+                ON scan_jobs(status, updated_at);
+
                 CREATE TABLE IF NOT EXISTS transfer_events (
                     event_key TEXT PRIMARY KEY,
                     run_id TEXT,
@@ -271,6 +286,99 @@ class EvidenceLedger:
         result.pop("result_json", None)
         return result
 
+    def upsert_scan_job(self, job: dict[str, Any]) -> None:
+        request_json = json.dumps(job.get("request") or {}, ensure_ascii=False, default=str)
+        result_json = (
+            json.dumps(job.get("result"), ensure_ascii=False, default=str)
+            if job.get("result") is not None
+            else None
+        )
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO scan_jobs(
+                    job_id, status, submitted_at, started_at, finished_at,
+                    request_json, result_json, error, updated_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(job_id) DO UPDATE SET
+                    status = excluded.status,
+                    started_at = excluded.started_at,
+                    finished_at = excluded.finished_at,
+                    request_json = excluded.request_json,
+                    result_json = excluded.result_json,
+                    error = excluded.error,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    str(job.get("job_id") or ""),
+                    str(job.get("status") or "UNKNOWN"),
+                    str(job.get("submitted_at") or _utc_now()),
+                    job.get("started_at"),
+                    job.get("finished_at"),
+                    request_json,
+                    result_json,
+                    job.get("error"),
+                    _utc_now(),
+                ),
+            )
+
+    def get_scan_job(self, job_id: str) -> dict[str, Any] | None:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM scan_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+        if not row:
+            return None
+        raw = dict(row)
+        try:
+            request = json.loads(raw.get("request_json") or "{}")
+        except json.JSONDecodeError:
+            request = {}
+        try:
+            result = json.loads(raw.get("result_json")) if raw.get("result_json") else None
+        except json.JSONDecodeError:
+            result = None
+        return {
+            "job_id": raw.get("job_id"),
+            "status": raw.get("status"),
+            "submitted_at": raw.get("submitted_at"),
+            "started_at": raw.get("started_at"),
+            "finished_at": raw.get("finished_at"),
+            "request": request,
+            "result": result,
+            "error": raw.get("error"),
+        }
+
+    def mark_incomplete_jobs_interrupted(self) -> int:
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE scan_jobs
+                SET status = 'INTERRUPTED',
+                    finished_at = COALESCE(finished_at, ?),
+                    error = COALESCE(error, 'Worker process restarted before completion.'),
+                    updated_at = ?
+                WHERE status IN ('QUEUED', 'RUNNING')
+                """,
+                (_utc_now(), _utc_now()),
+            )
+            return int(cursor.rowcount or 0)
+
+    def prune_scan_jobs(self, older_than_seconds: int) -> int:
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=max(0, older_than_seconds))
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM scan_jobs
+                WHERE updated_at < ?
+                  AND status NOT IN ('QUEUED', 'RUNNING')
+                """,
+                (cutoff.isoformat(),),
+            )
+            return int(cursor.rowcount or 0)
+
     def record_transfer_logs(self, run_id: str, logs: list[dict]) -> int:
         rows = []
         observed_at = _utc_now()
@@ -393,6 +501,9 @@ class EvidenceLedger:
                     ).fetchone()["n"],
                     "token_metadata": connection.execute(
                         "SELECT COUNT(*) AS n FROM token_metadata"
+                    ).fetchone()["n"],
+                    "scan_jobs": connection.execute(
+                        "SELECT COUNT(*) AS n FROM scan_jobs"
                     ).fetchone()["n"],
                 }
             return {"ok": True, "path": self.path, **counts}
