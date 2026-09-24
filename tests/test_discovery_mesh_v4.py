@@ -4,6 +4,7 @@ from services.discovery_mesh import DiscoveryMeshService
 from services.evidence_ledger import EvidenceLedger
 from services.openclaw_service import OpenClawService
 from services.signal_engine_v3 import WhaleSignalEngineV3
+from sources.persistent_etherscan_source import PersistentEtherscanSource
 
 
 class FakeDiscoverySource:
@@ -198,3 +199,36 @@ def test_scan_job_state_is_persisted_and_interrupted_on_restart(tmp_path):
     assert changed == 1
     assert restored["status"] == "INTERRUPTED"
     assert "restarted" in restored["error"].lower()
+
+
+def test_focused_scan_range_does_not_use_broad_incremental_checkpoint(tmp_path):
+    ledger = EvidenceLedger(str(tmp_path / "whalebot.db"))
+    ledger.set_checkpoint("ethereum:last_completed_block", 9_950)
+    source = PersistentEtherscanSource(
+        run_id="focused-range",
+        cache_policy="same_run_reuse",
+        ledger=ledger,
+    )
+
+    from_block, to_block = source.resolve_focused_scan_range(10_000, 900)
+
+    assert (from_block, to_block) == (9_100, 10_000)
+    assert source.scan_range["incremental"] is False
+    assert source.scan_range["focused"] is True
+    assert ledger.get_int_checkpoint("ethereum:last_completed_block") == 9_950
+
+
+def test_focused_completion_does_not_advance_broad_checkpoint():
+    class FakeSource:
+        def __init__(self):
+            self.completed = []
+
+        def complete_scan(self, to_block):
+            self.completed.append(to_block)
+
+    source = FakeSource()
+    engine = WhaleSignalEngineV3(source, market_source=object())
+    engine._complete_checkpoint(123, focused=True)
+    assert source.completed == []
+    engine._complete_checkpoint(124, focused=False)
+    assert source.completed == [124]
