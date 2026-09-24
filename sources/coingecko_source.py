@@ -95,7 +95,7 @@ class CoinGeckoSource:
                     "per_page": per_page,
                     "page": page,
                     "sparkline": "false",
-                    "price_change_percentage": "24h,7d",
+                    "price_change_percentage": "1h,24h,7d",
                 },
                 timeout=14,
                 retries=2,
@@ -120,7 +120,9 @@ class CoinGeckoSource:
                 {
                     "name": coin.get("name") or symbol,
                     "symbol": symbol,
+                    "id": coin.get("id"),
                     "price": self._safe_number(coin.get("current_price")),
+                    "change_1h": self._safe_number(coin.get("price_change_percentage_1h_in_currency")),
                     "change_24h": self._safe_number(coin.get("price_change_percentage_24h")),
                     "change_7d": self._safe_number(coin.get("price_change_percentage_7d_in_currency")),
                     "volume_24h": self._safe_number(coin.get("total_volume")),
@@ -156,6 +158,10 @@ class CoinGeckoSource:
 
         cleaned.sort(key=lambda item: (item.get("change_24h") or -999, item.get("volume_24h") or 0), reverse=True)
         return self._dedupe_movers(cleaned)[:limit]
+
+    def get_dexscreener_discovery(self, limit: int = 40) -> list[dict]:
+        """Always-on DexScreener discovery source for the v4 mesh."""
+        return self._get_dexscreener_boosted_movers(limit=limit)
 
     def _get_dexscreener_boosted_movers(self, limit: int = 8) -> list[dict]:
         try:
@@ -223,14 +229,19 @@ class CoinGeckoSource:
             return None
         volume = pair.get("volume") if isinstance(pair.get("volume"), dict) else {}
         price_change = pair.get("priceChange") if isinstance(pair.get("priceChange"), dict) else {}
+        liquidity = pair.get("liquidity") if isinstance(pair.get("liquidity"), dict) else {}
         boosts = pair.get("boosts") if isinstance(pair.get("boosts"), dict) else {}
         return {
             "name": name,
             "symbol": symbol,
             "price": self._safe_float_string(pair.get("priceUsd")),
+            "change_5m": self._safe_number(price_change.get("m5")),
+            "change_1h": self._safe_number(price_change.get("h1")),
+            "change_6h": self._safe_number(price_change.get("h6")),
             "change_24h": self._safe_number(price_change.get("h24")),
             "change_7d": None,
             "volume_24h": self._safe_number(volume.get("h24")),
+            "liquidity_usd": self._safe_number(liquidity.get("usd")),
             "rank": None,
             "market_cap": self._safe_number(pair.get("marketCap")) or self._safe_number(pair.get("fdv")),
             "source": "DexScreener",
