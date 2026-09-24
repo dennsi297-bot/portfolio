@@ -10,6 +10,7 @@ class CoinGeckoSource:
 
     def __init__(self) -> None:
         self._cache: dict[str, MarketContext] = {}
+        self._platform_cache: dict[str, str | None] = {}
         self.source_status: dict[str, str] = {
             "CoinGecko": "not_used",
             "DexScreener": "not_used",
@@ -81,6 +82,49 @@ class CoinGeckoSource:
 
         self._cache[contract_address] = context
         return context
+
+    def get_ethereum_contract(self, coin_id: str) -> str | None:
+        """Resolve a CoinGecko coin id to its canonical Ethereum contract when available."""
+        coin_id = str(coin_id or "").strip().lower()
+        if not coin_id:
+            return None
+        if coin_id in self._platform_cache:
+            return self._platform_cache[coin_id]
+
+        try:
+            payload = get_json_with_retry(
+                f"{COINGECKO_BASE_URL}/coins/{coin_id}",
+                source="CoinGecko",
+                headers=self._build_headers(),
+                params={
+                    "localization": "false",
+                    "tickers": "false",
+                    "market_data": "false",
+                    "community_data": "false",
+                    "developer_data": "false",
+                    "sparkline": "false",
+                },
+                timeout=12,
+                retries=2,
+            )
+            self._mark_ok("CoinGecko")
+        except ExternalAPIError as exc:
+            self._mark_error(exc)
+            self._platform_cache[coin_id] = None
+            return None
+
+        platforms = payload.get("platforms") if isinstance(payload, dict) else None
+        address = None
+        if isinstance(platforms, dict):
+            candidate = str(platforms.get("ethereum") or "").strip().lower()
+            if candidate.startswith("0x") and len(candidate) == 42:
+                try:
+                    int(candidate[2:], 16)
+                    address = candidate
+                except ValueError:
+                    address = None
+        self._platform_cache[coin_id] = address
+        return address
 
     def get_market_page(self, page: int = 1, per_page: int = 100) -> list[dict]:
         """Top market coins with 24h/7d performance for rotation mode."""
