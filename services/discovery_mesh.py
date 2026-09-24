@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from collections import Counter
+from collections import defaultdict
 from typing import Any
 
 from config.settings import (
     BASE_CONTEXT_SYMBOLS,
     DISCOVERY_COINGECKO_PAGES,
+    DISCOVERY_CONTRACT_RESOLUTION_LIMIT,
     DISCOVERY_COINGECKO_PER_PAGE,
     DISCOVERY_DEX_LIMIT,
     DISCOVERY_TOP_CANDIDATES,
@@ -61,13 +62,18 @@ class DiscoveryMeshService:
             not in (STABLECOIN_SYMBOLS | BASE_CONTEXT_SYMBOLS)
         ]
 
-        symbol_counts = Counter(str(row.get("symbol", "")).upper() for row in normalized)
+        sources_by_symbol: dict[str, set[str]] = defaultdict(set)
         for row in normalized:
-            row["source_consensus"] = symbol_counts[str(row.get("symbol", "")).upper()]
+            symbol = str(row.get("symbol", "")).upper()
+            source = str(row.get("source", ""))
+            if symbol and source:
+                sources_by_symbol[symbol].add(source)
+
+        for row in normalized:
+            symbol = str(row.get("symbol", "")).upper()
+            row["source_consensus"] = len(sources_by_symbol.get(symbol, set())) or 1
             row["discovery_score"] = self._score(row)
             row["status"] = self._status(row)
-            row["whale_status"] = self._initial_whale_status(row)
-            row["whale_reason"] = self._initial_whale_reason(row)
 
         deduped = self._dedupe(normalized)
         deduped.sort(
@@ -80,6 +86,25 @@ class DiscoveryMeshService:
             reverse=True,
         )
 
+        resolutions = 0
+        for row in deduped:
+            if resolutions >= max(0, DISCOVERY_CONTRACT_RESOLUTION_LIMIT):
+                break
+            if row.get("source") != "CoinGecko" or row.get("token_address"):
+                continue
+            coin_id = str(row.get("coin_id") or "")
+            if not coin_id or not hasattr(self.market_source, "get_ethereum_contract"):
+                continue
+            resolutions += 1
+            contract = self.market_source.get_ethereum_contract(coin_id)
+            if contract:
+                row["chain"] = "ethereum"
+                row["token_address"] = contract
+
+        for row in deduped:
+            row["whale_status"] = self._initial_whale_status(row)
+            row["whale_reason"] = self._initial_whale_reason(row)
+
         return {
             "ok": bool(market_rows or dex_rows),
             "mode": "discovery",
@@ -91,6 +116,7 @@ class DiscoveryMeshService:
                 "dexscreener_rows": len(dex_rows),
                 "combined_rows": len(normalized),
                 "cross_source_parallel": True,
+                "ethereum_contract_resolutions": resolutions,
             },
             "chain_coverage": {
                 "ethereum": "market_discovery_plus_whale_probe_supported",
