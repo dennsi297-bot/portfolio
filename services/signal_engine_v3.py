@@ -64,7 +64,13 @@ class WhaleSignalEngineV3(WhaleSignalEngineV2):
                     "scan_failed",
                 )
 
-            if hasattr(self.source, "resolve_scan_range"):
+            focused_contract = self._contract_focus(focus_term)
+            if focused_contract and hasattr(self.source, "resolve_focused_scan_range"):
+                from_block, to_block = self.source.resolve_focused_scan_range(
+                    latest_block,
+                    SCAN_LOOKBACK_BLOCKS,
+                )
+            elif hasattr(self.source, "resolve_scan_range"):
                 from_block, to_block = self.source.resolve_scan_range(
                     latest_block,
                     SCAN_LOOKBACK_BLOCKS,
@@ -73,7 +79,6 @@ class WhaleSignalEngineV3(WhaleSignalEngineV2):
                 from_block = max(latest_block - SCAN_LOOKBACK_BLOCKS, 0)
                 to_block = latest_block
 
-            focused_contract = self._contract_focus(focus_term)
             if focused_contract and hasattr(self.source, "get_contract_transfer_logs"):
                 market_logs = self.source.get_contract_transfer_logs(
                     focused_contract,
@@ -90,7 +95,7 @@ class WhaleSignalEngineV3(WhaleSignalEngineV2):
 
             erc20_logs = self._filter_erc20_logs(market_logs)
             if not erc20_logs:
-                self._complete_checkpoint(to_block)
+                self._complete_checkpoint(to_block, focused=bool(focused_contract))
                 reason = (
                     "Keine brauchbaren ERC-20 Transfer-Logs fuer den fokussierten Contract gefunden."
                     if focused_contract
@@ -108,7 +113,7 @@ class WhaleSignalEngineV3(WhaleSignalEngineV2):
                 else self._select_candidate_contracts(erc20_logs)
             )
             if not candidate_contracts:
-                self._complete_checkpoint(to_block)
+                self._complete_checkpoint(to_block, focused=bool(focused_contract))
                 return self._structured_no_signal(
                     "Keine auffaelligen Token-Cluster im aktuellen Markt-Sample gefunden.",
                     focus_term,
@@ -147,7 +152,7 @@ class WhaleSignalEngineV3(WhaleSignalEngineV2):
 
             if not raw_signals:
                 if not self.metadata_errors:
-                    self._complete_checkpoint(to_block)
+                    self._complete_checkpoint(to_block, focused=bool(focused_contract))
                 return self._structured_no_signal(
                     "Kein starkes Whale-Cluster im aktuellen ERC-20 Sample gefunden.",
                     focus_term,
@@ -158,7 +163,7 @@ class WhaleSignalEngineV3(WhaleSignalEngineV2):
             cleaned_signals = self._discard_conflicted_signals(raw_signals)
             if not cleaned_signals:
                 if not self.metadata_errors:
-                    self._complete_checkpoint(to_block)
+                    self._complete_checkpoint(to_block, focused=bool(focused_contract))
                 return self._structured_no_signal(
                     "Kein starkes einseitiges Whale-Cluster gefunden. Mixed-flow Tokens wurden verworfen.",
                     focus_term,
@@ -198,7 +203,7 @@ class WhaleSignalEngineV3(WhaleSignalEngineV2):
             text = self._format_scan_response(display_signals, diagnostics)
             complete = not self.metadata_errors
             if complete:
-                self._complete_checkpoint(to_block)
+                self._complete_checkpoint(to_block, focused=bool(focused_contract))
             self.last_scan_snapshot.update(
                 {
                     "quality_architecture": QUALITY_ARCHITECTURE_VERSION,
@@ -340,7 +345,9 @@ class WhaleSignalEngineV3(WhaleSignalEngineV2):
         }
         return self._format_failure_response(title, reason, status)
 
-    def _complete_checkpoint(self, to_block: int) -> None:
+    def _complete_checkpoint(self, to_block: int, *, focused: bool = False) -> None:
+        if focused:
+            return
         if hasattr(self.source, "complete_scan"):
             self.source.complete_scan(to_block)
 
