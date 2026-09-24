@@ -101,6 +101,19 @@ class DiscoveryMeshService:
                 row["chain"] = "ethereum"
                 row["token_address"] = contract
 
+        # Contract resolution can reveal that a CoinGecko row and a Dex row are
+        # the same Ethereum asset. Collapse again on the now-known contract key.
+        deduped = self._dedupe(deduped)
+        deduped.sort(
+            key=lambda row: (
+                float(row.get("discovery_score") or 0.0),
+                float(row.get("change_1h") or 0.0),
+                float(row.get("change_24h") or 0.0),
+                float(row.get("volume_24h") or 0.0),
+            ),
+            reverse=True,
+        )
+
         for row in deduped:
             row["whale_status"] = self._initial_whale_status(row)
             row["whale_reason"] = self._initial_whale_reason(row)
