@@ -20,6 +20,7 @@ Dienst; OpenClaw kann ihn ueber die maschinenlesbaren Endpunkte verwenden.
 - `scan gainers` – Preis-/Volumen-Mover
 - `scan rotation` – Relative Staerke gegen BTC, ETH und Altmarkt
 - `scan rotation <coin>` – fokussierte Rotation
+- OpenClaw-Modus `discovery` – breiter CoinGecko + paralleler DexScreener Early-Move-Scan mit fokussiertem Ethereum-Whale-Fan-out
 - `0x...` – Ethereum-Wallet-Check
 
 ## OpenClaw API
@@ -44,9 +45,25 @@ Unterstuetzte Modi:
 - `rotation`
 - `confluence`
 - `wallet`
+- `universe`
+- `discovery`
 
 Die Antwort enthaelt Schema-/Engine-Version, Source-Status, Cache-Diagnostik,
 strukturierte Scan-Daten und den kompatiblen Textoutput.
+
+## Discovery Mesh v4
+
+Der Discovery-Pfad ist jetzt ein eigener Sensor-Layer vor der Whale-Bestaetigung:
+
+- CoinGecko wird ueber mehrere Marktseiten statt nur Top-100 gescannt.
+- 1h-/24h-/7d-Bewegung wird ausgewertet; DexScreener liefert zusaetzlich 5m/1h/6h/24h.
+- DexScreener laeuft parallel und nicht mehr nur als Fallback bei CoinGecko-Ausfall.
+- Ethereum-Kandidaten mit Contract erhalten begrenzte fokussierte Whale-Probes.
+- Fokussierte Contract-Scans fragen Etherscan direkt fuer diesen Contract ab, statt davon abzuhaengen, ob er im breiten Top-Sample auftaucht.
+- Andere Chains bleiben sichtbar, werden aber explizit als `CHAIN_UNSUPPORTED` fuer Whale-Evidence markiert. Das ist nicht dasselbe wie `NONE_FOUND`.
+- Discovery + Whale-Evidence wird als getrennte Evidenz gefuehrt; der Bot erstellt weiterhin keine Orders und keine Paper Entries.
+- Asynchrone Job-Zustaende werden im Evidence-Ledger persistiert. Nach einem Prozessneustart verschwinden laufende Jobs nicht still, sondern werden als `INTERRUPTED` markiert.
+- `/health` meldet, ob der konfigurierte SQLite-Pfad nach `/tmp` zeigt und damit wahrscheinlich ephemer ist.
 
 ## Signal Quality v2
 
@@ -76,7 +93,7 @@ Die v2-Engine beseitigt mehrere systematische Fehlerquellen:
 - Accumulation/Distribution ist transferbasiert, nicht DEX-buy/sell-bestaetigt
 - Etherscan liefert eine aktuelle Stichprobe, keine Vollabdeckung
 - Entity Labels fuer Exchanges, Router, Bridges und Treasury-Wallets fehlen noch
-- SUI und PLUME brauchen eigene Chain-/Explorer-Quellen
+- Whale-Bestaetigung ist aktuell Ethereum-spezifisch; andere Chains brauchen eigene Chain-/Explorer-Adapter
 
 ## Environment
 
