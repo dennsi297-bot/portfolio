@@ -76,6 +76,22 @@ class PersistentEtherscanSource(EtherscanSource):
         self.ledger.record_transfer_logs(self.run_id, logs)
         return logs
 
+    def get_contract_transfer_logs(
+        self,
+        contract_address: str,
+        from_block: int,
+        to_block: int,
+        pages: int,
+    ) -> list[dict]:
+        logs = super().get_contract_transfer_logs(
+            contract_address,
+            from_block,
+            to_block,
+            pages,
+        )
+        self.ledger.record_transfer_logs(self.run_id, logs)
+        return logs
+
     def get_token_metadata(self, contract_address: str) -> TokenMetadata | None:
         key = contract_address.lower()
         now = time.monotonic()
