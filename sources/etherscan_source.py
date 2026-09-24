@@ -149,6 +149,47 @@ class EtherscanSource:
 
         return all_logs
 
+    def get_contract_transfer_logs(
+        self,
+        contract_address: str,
+        from_block: int,
+        to_block: int,
+        pages: int,
+    ) -> list[dict]:
+        """Focused ERC-20 transfer log scan for one Ethereum contract."""
+        api_key = get_etherscan_api_key()
+        if not api_key:
+            return []
+
+        all_logs: list[dict] = []
+        seen_keys: set[tuple[str, str]] = set()
+        for page in range(1, pages + 1):
+            data = self.call(
+                {
+                    "chainid": "1",
+                    "module": "logs",
+                    "action": "getLogs",
+                    "fromBlock": str(from_block),
+                    "toBlock": str(to_block),
+                    "address": contract_address.lower(),
+                    "topic0": TRANSFER_TOPIC,
+                    "page": str(page),
+                    "offset": str(MARKET_LOG_PAGE_SIZE),
+                    "apikey": api_key,
+                }
+            )
+            result = data.get("result")
+            if not isinstance(result, list) or not result:
+                break
+            for log in result:
+                log_key = (str(log.get("transactionHash", "")), str(log.get("logIndex", "")))
+                if log_key not in seen_keys:
+                    seen_keys.add(log_key)
+                    all_logs.append(log)
+            if len(result) < MARKET_LOG_PAGE_SIZE:
+                break
+        return all_logs
+
     def get_token_metadata(self, contract_address: str) -> TokenMetadata | None:
         contract_address = contract_address.lower()
         if contract_address in self._metadata_cache:
