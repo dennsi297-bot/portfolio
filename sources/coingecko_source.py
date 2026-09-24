@@ -160,63 +160,98 @@ class CoinGeckoSource:
         return self._dedupe_movers(cleaned)[:limit]
 
     def get_dexscreener_discovery(self, limit: int = 40) -> list[dict]:
-        """Always-on DexScreener discovery source for the v4 mesh."""
-        return self._get_dexscreener_boosted_movers(limit=limit)
+        """Always-on DexScreener discovery from several independent seed feeds."""
+        return self._get_dexscreener_seeded_movers(
+            endpoints=[
+                "/token-boosts/top/v1",
+                "/token-boosts/latest/v1",
+                "/token-profiles/latest/v1",
+            ],
+            limit=limit,
+        )
 
     def _get_dexscreener_boosted_movers(self, limit: int = 8) -> list[dict]:
-        try:
-            boosted_payload = get_json_with_retry(
-                f"{self.DEXSCREENER_BASE_URL}/token-boosts/top/v1",
-                source="DexScreener",
-                timeout=12,
-                retries=2,
-            )
-            self._mark_ok("DexScreener")
-        except ExternalAPIError as exc:
-            self._mark_error(exc)
-            return []
+        return self._get_dexscreener_seeded_movers(
+            endpoints=["/token-boosts/top/v1"],
+            limit=limit,
+        )
 
-        if not isinstance(boosted_payload, list):
-            self.source_status["DexScreener"] = "invalid_payload"
-            return []
-
-        addresses_by_chain: dict[str, list[str]] = {}
-        for item in boosted_payload[:30]:
-            if not isinstance(item, dict):
-                continue
-            chain_id = str(item.get("chainId", "")).strip()
-            token_address = str(item.get("tokenAddress", "")).strip()
-            if not chain_id or not token_address:
-                continue
-            addresses_by_chain.setdefault(chain_id, []).append(token_address)
-
-        pair_rows: list[dict] = []
-        for chain_id, addresses in addresses_by_chain.items():
-            chunk = addresses[:30]
-            if not chunk:
-                continue
+    def _get_dexscreener_seeded_movers(
+        self,
+        *,
+        endpoints: list[str],
+        limit: int,
+    ) -> list[dict]:
+        seed_items: list[dict] = []
+        any_success = False
+        for endpoint in endpoints:
             try:
-                pairs_payload = get_json_with_retry(
-                    f"{self.DEXSCREENER_BASE_URL}/tokens/v1/{chain_id}/{','.join(chunk)}",
+                payload = get_json_with_retry(
+                    f"{self.DEXSCREENER_BASE_URL}{endpoint}",
                     source="DexScreener",
                     timeout=12,
                     retries=2,
                 )
                 self._mark_ok("DexScreener")
+                any_success = True
             except ExternalAPIError as exc:
                 self._mark_error(exc)
                 continue
+            if isinstance(payload, list):
+                seed_items.extend(item for item in payload if isinstance(item, dict))
 
-            if not isinstance(pairs_payload, list):
-                self.source_status["DexScreener"] = "invalid_payload"
+        if not any_success:
+            return []
+
+        addresses_by_chain: dict[str, list[str]] = {}
+        seen_seed_keys: set[tuple[str, str]] = set()
+        for item in seed_items:
+            chain_id = str(item.get("chainId", "")).strip()
+            token_address = str(item.get("tokenAddress", "")).strip()
+            key = (chain_id.lower(), token_address.lower())
+            if not chain_id or not token_address or key in seen_seed_keys:
                 continue
-            for pair in pairs_payload:
-                parsed = self._parse_dex_pair(pair)
-                if parsed:
-                    pair_rows.append(parsed)
+            seen_seed_keys.add(key)
+            addresses_by_chain.setdefault(chain_id, []).append(token_address)
 
-        pair_rows.sort(key=lambda item: (item.get("boosts") or 0, item.get("change_24h") or -999, item.get("volume_24h") or 0), reverse=True)
-        return self._dedupe_movers(pair_rows)[:limit]
+        pair_rows: list[dict] = []
+        for chain_id, addresses in addresses_by_chain.items():
+            # DexScreener accepts comma-separated token addresses; keep each call bounded.
+            for chunk_start in range(0, min(len(addresses), 60), 30):
+                chunk = addresses[chunk_start:chunk_start + 30]
+                if not chunk:
+                    continue
+                try:
+                    pairs_payload = get_json_with_retry(
+                        f"{self.DEXSCREENER_BASE_URL}/tokens/v1/{chain_id}/{','.join(chunk)}",
+                        source="DexScreener",
+                        timeout=12,
+                        retries=2,
+                    )
+                    self._mark_ok("DexScreener")
+                except ExternalAPIError as exc:
+                    self._mark_error(exc)
+                    continue
+
+                if not isinstance(pairs_payload, list):
+                    self.source_status["DexScreener"] = "invalid_payload"
+                    continue
+                for pair in pairs_payload:
+                    parsed = self._parse_dex_pair(pair)
+                    if parsed:
+                        pair_rows.append(parsed)
+
+        pair_rows.sort(
+            key=lambda item: (
+                item.get("change_1h") or -999,
+                item.get("change_5m") or -999,
+                item.get("volume_24h") or 0,
+                item.get("liquidity_usd") or 0,
+                item.get("boosts") or 0,
+            ),
+            reverse=True,
+        )
+        return self._dedupe_movers(pair_rows)[: max(1, limit)]
 
     def _parse_dex_pair(self, pair: dict) -> dict | None:
         if not isinstance(pair, dict):
@@ -245,7 +280,7 @@ class CoinGeckoSource:
             "rank": None,
             "market_cap": self._safe_number(pair.get("marketCap")) or self._safe_number(pair.get("fdv")),
             "source": "DexScreener",
-            "note": "boosted/trending token fallback",
+            "note": "dexscreener discovery candidate",
             "chain": pair.get("chainId"),
             "boosts": self._safe_number(boosts.get("active")),
             "token_address": token_address,
