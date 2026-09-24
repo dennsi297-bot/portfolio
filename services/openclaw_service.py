@@ -7,10 +7,12 @@ from datetime import datetime, timezone
 from config.settings import (
     CACHE_POLICIES,
     DEFAULT_CACHE_POLICY,
+    DISCOVERY_WHALE_FANOUT,
     OPENCLAW_SCHEMA_VERSION,
     QUALITY_ARCHITECTURE_VERSION,
     SIGNAL_ENGINE_VERSION,
 )
+from services.discovery_mesh import DiscoveryMeshService
 from services.evidence_ledger import EvidenceLedger, get_evidence_ledger
 from services.market_universe_service import MarketUniverseService
 from services.message_service import MessageService
@@ -31,6 +33,7 @@ class OpenClawService:
         "confluence",
         "wallet",
         "universe",
+        "discovery",
     }
 
     def __init__(self, ledger: EvidenceLedger | None = None) -> None:
@@ -49,6 +52,7 @@ class OpenClawService:
                 "confluence": "Independent focused whale plus focused rotation scan.",
                 "wallet": "Structured Ethereum wallet balance and recent transactions.",
                 "universe": "Rolling broad-market coverage with persistent page cursor.",
+                "discovery": "Broad CoinGecko plus always-on DexScreener acceleration discovery with bounded Ethereum whale fan-out.",
             },
             "cache_policies": sorted(CACHE_POLICIES),
             "verification_passes": {"minimum": 1, "maximum": 3},
@@ -57,6 +61,8 @@ class OpenClawService:
                 "Stale/degraded rotation cannot create strong_confluence.",
                 "Multiple verification passes remain independent via audit_refresh.",
                 "Incremental wallet scans retain overlap and periodic full-audit support.",
+                "Market discovery and whale confirmation remain separate evidence layers.",
+                "Unsupported chains are reported as not evaluated, never as no-whale.",
             ],
             "commands": [
                 "scan",
@@ -65,6 +71,7 @@ class OpenClawService:
                 "scan rotation",
                 "scan rotation <symbol>",
                 "0x<wallet>",
+                "openclaw mode: discovery",
             ],
             "limitations": [
                 "Whale direction is transfer-based and not yet a DEX-confirmed buy/sell.",
@@ -201,6 +208,12 @@ class OpenClawService:
         market_pages_per_run: int,
         market_max_pages: int,
     ) -> dict:
+        if mode == "discovery":
+            return self._run_discovery_mesh(
+                cache_policy=cache_policy,
+                run_id=run_id,
+            )
+
         if mode == "confluence":
             if not focus:
                 raise ValueError("confluence requires focus.")
@@ -254,6 +267,146 @@ class OpenClawService:
             market_pages_per_run=market_pages_per_run,
             market_max_pages=market_max_pages,
         )
+
+    def _run_discovery_mesh(
+        self,
+        *,
+        cache_policy: str,
+        run_id: str,
+    ) -> dict:
+        market = FreshCoinGeckoSource(cache_policy=cache_policy)
+        data = DiscoveryMeshService(market).scan()
+        probe_results: list[dict] = []
+        probe_count = 0
+
+        for index, candidate in enumerate(data.get("top_candidates") or [], start=1):
+            if probe_count >= max(0, DISCOVERY_WHALE_FANOUT):
+                break
+            if candidate.get("whale_status") != "PENDING":
+                continue
+            contract = str(candidate.get("token_address") or "").lower()
+            if not is_ethereum_wallet(contract):
+                candidate["whale_status"] = "NOT_EVALUATED_INVALID_CONTRACT"
+                candidate["whale_reason"] = "Ethereum candidate had no valid 0x contract."
+                continue
+
+            probe_count += 1
+            probe_run_id = f"{run_id}-whale-probe-{probe_count}"
+            whale = self._run_single(
+                "whale",
+                contract,
+                None,
+                cache_policy=cache_policy,
+                run_id=probe_run_id,
+            )
+            probe_results.append(whale)
+            candidate["whale_probe_run_id"] = probe_run_id
+
+            if not whale.get("ok"):
+                candidate["whale_status"] = "FAILED"
+                candidate["whale_reason"] = "Focused Ethereum whale probe failed."
+                candidate["whale_signal"] = None
+                continue
+            if whale.get("degraded"):
+                candidate["whale_status"] = "FAILED_SOURCE_DEGRADED"
+                candidate["whale_reason"] = "Focused whale probe completed with degraded source quality."
+                candidate["whale_signal"] = None
+                continue
+
+            rows = (whale.get("data") or {}).get("signals") or []
+            match = next(
+                (
+                    row
+                    for row in rows
+                    if str(row.get("contract") or "").lower() == contract
+                ),
+                None,
+            )
+            if match is not None:
+                candidate["whale_status"] = "WHALE_FOUND"
+                candidate["whale_reason"] = "Focused Ethereum transfer-cluster evidence found."
+                candidate["whale_signal"] = match
+            else:
+                candidate["whale_status"] = "NONE_FOUND"
+                candidate["whale_reason"] = "Focused Ethereum probe found no qualifying cluster in the configured window."
+                candidate["whale_signal"] = None
+
+        for candidate in data.get("top_candidates") or []:
+            bonus = 25.0 if candidate.get("whale_status") == "WHALE_FOUND" else 0.0
+            candidate["priority_score"] = round(
+                float(candidate.get("discovery_score") or 0.0) + bonus,
+                2,
+            )
+            candidate["confluence"] = (
+                "market_plus_whale"
+                if candidate.get("whale_status") == "WHALE_FOUND"
+                else "market_only"
+            )
+
+        data["top_candidates"] = sorted(
+            data.get("top_candidates") or [],
+            key=lambda row: float(row.get("priority_score") or 0.0),
+            reverse=True,
+        )
+        data["whale_probe_summary"] = {
+            "configured_fanout": DISCOVERY_WHALE_FANOUT,
+            "probes_run": probe_count,
+            "whale_found": sum(
+                1
+                for row in data.get("top_candidates") or []
+                if row.get("whale_status") == "WHALE_FOUND"
+            ),
+            "none_found": sum(
+                1
+                for row in data.get("top_candidates") or []
+                if row.get("whale_status") == "NONE_FOUND"
+            ),
+            "unsupported_chain": sum(
+                1
+                for row in data.get("top_candidates") or []
+                if row.get("whale_status") == "CHAIN_UNSUPPORTED"
+            ),
+        }
+
+        base_status = {
+            "source_status": dict(getattr(market, "source_status", {})),
+            "source_errors": list(getattr(market, "last_errors", [])),
+        }
+        source_status = self._merge_source_status(base_status, *probe_results)
+        source_errors = self._merge_source_errors(base_status, *probe_results)
+        degraded = self._is_degraded(source_status)
+        data = self._apply_freshness_guard("discovery", data, source_status)
+        ok = bool(data.get("ok"))
+        decision_eligible = bool(
+            ok
+            and not degraded
+            and data.get("freshness_eligible", True)
+            and any(
+                row.get("whale_status") == "WHALE_FOUND"
+                for row in data.get("top_candidates") or []
+            )
+        )
+        data["decision_eligible"] = decision_eligible
+
+        return {
+            "schema_version": OPENCLAW_SCHEMA_VERSION,
+            "engine_version": SIGNAL_ENGINE_VERSION,
+            "generated_at": self._now(),
+            "ok": ok,
+            "degraded": degraded,
+            "decision_eligible": decision_eligible,
+            "mode": "discovery",
+            "focus": None,
+            "command": "discovery mesh",
+            "source_status": source_status,
+            "source_errors": source_errors,
+            "cache": {"market": market.cache_diagnostics()},
+            "data": data,
+            "response_text": (
+                f"Discovery mesh scanned {data.get('coverage', {}).get('combined_rows', 0)} rows; "
+                f"focused whale probes {probe_count}."
+            ),
+        }
 
     def _run_single(
         self,
@@ -528,7 +681,7 @@ class OpenClawService:
                 )
                 for row in data.get("signals") or []
             ))
-        if mode in {"rotation", "universe"}:
+        if mode in {"rotation", "universe", "discovery"}:
             return tuple(
                 (row.get("symbol"), row.get("status"))
                 for row in (data.get("top_candidates") or [])[:10]

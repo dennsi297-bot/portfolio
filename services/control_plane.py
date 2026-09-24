@@ -36,6 +36,7 @@ CAPABILITY_MANIFEST: dict[str, Any] = {
         "confluence": "Independent focused whale plus focused rotation scan.",
         "wallet": "Structured Ethereum wallet balance and recent transactions.",
         "universe": "Rolling broad-market coverage with persistent page cursor.",
+        "discovery": "Broad CoinGecko plus always-on DexScreener acceleration discovery with bounded Ethereum whale fan-out.",
     },
     "supported_parameters": {
         "whale": {
@@ -63,6 +64,10 @@ CAPABILITY_MANIFEST: dict[str, Any] = {
             "market_max_pages": "1..25",
             "cache_policy": sorted(CACHE_POLICIES),
         },
+        "discovery": {
+            "cache_policy": sorted(CACHE_POLICIES),
+            "notes": "Parallel market discovery; Ethereum candidates receive bounded focused whale probes.",
+        },
     },
     "endpoints": {
         "synchronous_scan": "POST /openclaw/scan",
@@ -76,6 +81,8 @@ CAPABILITY_MANIFEST: dict[str, Any] = {
         "Independent verification passes use audit_refresh after pass one.",
         "Incremental Ethereum scans use overlap; audit_refresh scans the full lookback.",
         "Static token metadata is cached; dynamic wallet evidence remains freshly scanned.",
+        "Market discovery and whale confirmation remain separate evidence layers.",
+        "Unsupported chains are reported as not evaluated, never as no-whale.",
     ],
     "commands": [
         "scan",
@@ -84,6 +91,7 @@ CAPABILITY_MANIFEST: dict[str, Any] = {
         "scan rotation",
         "scan rotation <symbol>",
         "0x<wallet>",
+        "openclaw mode: discovery",
     ],
     "limitations": [
         "Whale direction is transfer-based and not yet a DEX-confirmed buy/sell.",
@@ -134,6 +142,8 @@ def _with_control_telemetry(payload: dict[str, Any], response_started_at: str | 
 
 def health_payload() -> dict[str, Any]:
     ledger = get_evidence_ledger().diagnostics()
+    ledger_path = str(ledger.get("path") or "")
+    storage_persistent = bool(ledger_path and not ledger_path.startswith("/tmp/"))
     return _with_control_telemetry(
         {
             "ok": bool(ledger.get("ok")),
@@ -144,6 +154,8 @@ def health_payload() -> dict[str, Any]:
             "scan_worker_available": True,
             "etherscan_configured": bool(get_etherscan_api_key()),
             "evidence_ledger": ledger,
+            "storage_persistent": storage_persistent,
+            "storage_warning": None if storage_persistent else "WHALEBOT_DB_PATH points to ephemeral /tmp storage.",
         }
     )
 

@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from config.settings import SCAN_JOB_MAX_WORKERS, SCAN_JOB_RETENTION_SECONDS
+from services.evidence_ledger import EvidenceLedger, get_evidence_ledger
 from services.openclaw_service import OpenClawService
 
 
@@ -18,11 +19,13 @@ def _now() -> str:
 class ScanJobService:
     """Serialized background execution for long, quality-preserving scans."""
 
-    def __init__(self) -> None:
+    def __init__(self, ledger: EvidenceLedger | None = None) -> None:
         self._executor = ThreadPoolExecutor(max_workers=max(1, SCAN_JOB_MAX_WORKERS))
         self._jobs: dict[str, dict[str, Any]] = {}
         self._created_monotonic: dict[str, float] = {}
         self._lock = threading.RLock()
+        self._ledger = ledger or get_evidence_ledger()
+        self._ledger.mark_incomplete_jobs_interrupted()
 
     def submit(self, payload: dict[str, Any]) -> dict[str, Any]:
         self._cleanup()
@@ -40,6 +43,7 @@ class ScanJobService:
         with self._lock:
             self._jobs[job_id] = job
             self._created_monotonic[job_id] = time.monotonic()
+        self._ledger.upsert_scan_job(job)
         self._executor.submit(self._run, job_id, dict(payload))
         return self.get(job_id) or job
 
@@ -47,13 +51,17 @@ class ScanJobService:
         self._cleanup()
         with self._lock:
             job = self._jobs.get(job_id)
-            return dict(job) if job is not None else None
+            if job is not None:
+                return dict(job)
+        return self._ledger.get_scan_job(job_id)
 
     def _run(self, job_id: str, payload: dict[str, Any]) -> None:
         with self._lock:
             job = self._jobs[job_id]
             job["status"] = "RUNNING"
             job["started_at"] = _now()
+            running_snapshot = dict(job)
+        self._ledger.upsert_scan_job(running_snapshot)
         try:
             result = OpenClawService().execute(
                 mode=str(payload.get("mode", "whale")),
@@ -70,12 +78,16 @@ class ScanJobService:
                 job["status"] = "COMPLETED" if result.get("ok") else "COMPLETED_WITH_SOURCE_ERROR"
                 job["result"] = result
                 job["finished_at"] = _now()
+                completed_snapshot = dict(job)
+            self._ledger.upsert_scan_job(completed_snapshot)
         except Exception as exc:
             with self._lock:
                 job = self._jobs[job_id]
                 job["status"] = "FAILED"
                 job["error"] = str(exc)
                 job["finished_at"] = _now()
+                failed_snapshot = dict(job)
+            self._ledger.upsert_scan_job(failed_snapshot)
 
     def _cleanup(self) -> None:
         cutoff = time.monotonic() - SCAN_JOB_RETENTION_SECONDS
@@ -90,6 +102,7 @@ class ScanJobService:
             for job_id in expired:
                 self._created_monotonic.pop(job_id, None)
                 self._jobs.pop(job_id, None)
+        self._ledger.prune_scan_jobs(SCAN_JOB_RETENTION_SECONDS)
 
 
 _scan_job_service = ScanJobService()
