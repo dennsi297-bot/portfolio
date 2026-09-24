@@ -11,7 +11,7 @@ NAME_METHOD = "0x06fdde03"
 
 SIGNAL_ENGINE_VERSION = "3.0.0"
 OPENCLAW_SCHEMA_VERSION = "whalebot.openclaw.v1"
-QUALITY_ARCHITECTURE_VERSION = "whalebot.quality.v3"
+QUALITY_ARCHITECTURE_VERSION = "whalebot.quality.v4"
 
 SCAN_LOOKBACK_BLOCKS = 900
 INCREMENTAL_OVERLAP_BLOCKS = 50
@@ -25,6 +25,14 @@ METADATA_RESOLUTION_WORKERS = 3
 LARGE_EVENT_PERCENTILE = 0.8
 MAX_RESULTS = 3
 COINGECKO_ENRICH_LIMIT = 18
+
+# WhaleBot v4 discovery mesh: broad market discovery runs independently from
+# whale confirmation and fans out only a bounded number of focused probes.
+DISCOVERY_COINGECKO_PAGES = int(os.getenv("WHALEBOT_DISCOVERY_COINGECKO_PAGES", "5"))
+DISCOVERY_COINGECKO_PER_PAGE = int(os.getenv("WHALEBOT_DISCOVERY_COINGECKO_PER_PAGE", "100"))
+DISCOVERY_DEX_LIMIT = int(os.getenv("WHALEBOT_DISCOVERY_DEX_LIMIT", "40"))
+DISCOVERY_TOP_CANDIDATES = int(os.getenv("WHALEBOT_DISCOVERY_TOP_CANDIDATES", "25"))
+DISCOVERY_WHALE_FANOUT = int(os.getenv("WHALEBOT_DISCOVERY_WHALE_FANOUT", "6"))
 
 # Signal-quality rules: raw token units are not comparable between tokens.
 MIN_ESTIMATED_NOTIONAL_USD = 50_000.0
