@@ -62,6 +62,29 @@ class PersistentEtherscanSource(EtherscanSource):
         }
         return from_block, latest_block
 
+    def resolve_focused_scan_range(
+        self,
+        latest_block: int,
+        default_lookback: int = SCAN_LOOKBACK_BLOCKS,
+    ) -> tuple[int, int]:
+        """Focused probes always inspect the full configured lookback.
+
+        They must not inherit or advance the broad-market checkpoint because doing
+        so could make a later broad incremental scan skip unrelated market events.
+        """
+        from_block = max(latest_block - default_lookback, 0)
+        checkpoint = self.ledger.get_int_checkpoint("ethereum:last_completed_block")
+        self.scan_range = {
+            "from_block": from_block,
+            "to_block": latest_block,
+            "checkpoint_before": checkpoint if checkpoint is not None else -1,
+            "overlap_blocks": 0,
+            "incremental": False,
+            "focused": True,
+            "cache_policy": self.cache_policy,
+        }
+        return from_block, latest_block
+
     def complete_scan(self, to_block: int) -> None:
         self.ledger.set_checkpoint("ethereum:last_completed_block", to_block)
         self.scan_range["checkpoint_after"] = to_block
